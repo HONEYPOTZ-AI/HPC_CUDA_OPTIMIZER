@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# =============================================================================
+# ephemeral_runner.sh  —  Single-use GitHub Actions runner inside a SLURM job
+#
+# This script is submitted AS the SLURM batch payload by runner_poller.sh.
+# It runs entirely on a COMPUTE NODE (not the login node), registers itself
+# as a one-shot runner, picks up exactly one queued job, and self-destructs.
+#
+# Why ephemeral?
+#   - Full GPU isolation: each job gets a fresh environment on a dedicated node
+#   - No state leakage between runs (no leftover CUDA contexts, temp files)
+#   - Easy horizontal scaling: poller submits N ephemeral runners in parallel
+#
+# Called by runner_poller.sh via sbatch, not by humans directly.
+#
+# Required env vars (injected by sbatch #SBATCH --export):
+#   GH_REPO_URL          Full repo URL
+#   GH_RUNNER_TOKEN      Registration token (fresh, single-use from GitHub API)
+#   RUNNER_INSTALL_DIR   Path to runner binary installation (shared filesystem)
+#   RUNNER_WORKDIR       Work directory (should be on fast local or parallel FS)
+#   SLURM_JOB_ID         Set automatically by SLURM
+#   SLURM_NODEID         Set automatically by SLURM
+# =============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="${RUNNER_INSTALL_DIR:-/opt/gh-runner}"
+source "${SCRIPT_DIR}/runner_env.sh" 2>/dev/null || true
+
+# ── Derived identifiers ───────────────────────────────────────────────────────
+NODE_NAME=$(hostname -s)
+EPHEMERAL_NAME="${NODE_NAME}-slurm-${SLURM_JOB_ID:-$$}"
+EPHEMERAL_WORKDIR="${RUNNER_WORKDIR:-/scratch/gh-runner/work}/${EPHEMERAL_NAME}"
+EPHEMERAL_DIR="${SCRIPT_DIR}/ephemeral/${EPHEMERAL_NAME}"
+
+info()    { echo "[ephemeral:${NODE_NAME}] $*"; }
+success() { echo "[ephemeral:${NODE_NAME}][OK] $*"; }
+die()     { echo "[ephemeral:${NODE_NAME}][ERR] $*" >&2; exit 1; }
+
+# ── Validate required inputs ──────────────────────────────────────────────────
+[[ -z "${GH_REPO_URL:-}"      ]] && die "GH_REPO_URL not set."
+[[ -z "${GH_RUNNER_TOKEN:-}"  ]] && die "GH_RUNNER_TOKEN not set."
+
+# ── Show node info ────────────────────────────────────────────────────────────
+info "=== Ephemeral runner starting ==="
+info "SLURM job ID  : ${SLURM_JOB_ID:-N/A}"
+info "Node          : ${NODE_NAME}"
+info "Runner name   : ${EPHEMERAL_NAME}"
+info "Work dir      : ${EPHEMERAL_WORKDIR}"
+info "GPUs on node  :"
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null \
+  | while IFS= read -r line; do info "  GPU ${line}"; done || info "  (nvidia-smi not available)"
+
+# ── Create isolated work directory ───────────────────────────────────────────
+mkdir -p "${EPHEMERAL_DIR}" "${EPHEMERAL_WORKDIR}"
+
+# ── Detect GPU labels for this node ──────────────────────────────────────────
+GPU_LABELS="self-hosted,Linux,X64,hpc,cuda,gpu,slurm,ephemeral"
+if command -v nvidia-smi &>/dev/null; then
+  GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+  GPU_LABELS="${GPU_LABELS},gpu${GPU_COUNT}x"
+  while IFS= read -r gpu_name; do
+    case "$gpu_name" in
+      *V100*) GPU_LABELS="${GPU_LABELS},sm70,volta" ;;
+      *A100*) GPU_LABELS="${GPU_LABELS},sm80,ampere" ;;
+      *H100*) GPU_LABELS="${GPU_LABELS},sm90,hopper" ;;
+    esac
+  done < <(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)
+fi
+info "Labels: ${GPU_LABELS}"
+
+# ── Copy runner binary to ephemeral dir (uses hard links for speed) ───────────
+# The runner binary in RUNNER_INSTALL_DIR is the canonical install.
+# We create a private copy so this runner's config doesn't clash with others.
+info "Setting up ephemeral runner directory..."
+for f in "${SCRIPT_DIR}"/{config.sh,run.sh,run-helper.sh,bin,externals,runner_env.sh,slurm_job_wrapper.sh}; do
+  [[ -e "$f" ]] && cp -al "$f" "${EPHEMERAL_DIR}/" 2>/dev/null || \
+    cp -a  "$f" "${EPHEMERAL_DIR}/" 2>/dev/null || true
+done
+
+# ── Register as one-shot (--once) runner ─────────────────────────────────────
+info "Registering ephemeral runner with GitHub..."
+cd "${EPHEMERAL_DIR}"
+
+./config.sh \
+  --url   "${GH_REPO_URL}" \
+  --token "${GH_RUNNER_TOKEN}" \
+  --name  "${EPHEMERAL_NAME}" \
+  --labels "${GPU_LABELS}" \
+  --work  "${EPHEMERAL_WORKDIR}" \
+  --replace \
+  --unattended \
+  --ephemeral      # <-- key flag: runner exits after ONE job
+success "Runner registered."
+
+# ── Cleanup trap ──────────────────────────────────────────────────────────────
+cleanup() {
+  local code=$?
+  info "Cleaning up ephemeral runner (exit code: ${code})..."
+  # Attempt graceful de-registration (best-effort; token may already be spent)
+  "${EPHEMERAL_DIR}/config.sh" remove --unattended \
+    --token "${GH_RUNNER_TOKEN}" 2>/dev/null || true
+  # Remove ephemeral dirs
+  rm -rf "${EPHEMERAL_DIR}" 2>/dev/null || true
+  rm -rf "${EPHEMERAL_WORKDIR}" 2>/dev/null || true
+  info "Cleanup done."
+}
+trap cleanup EXIT
+
+# ── Run exactly one job then exit ─────────────────────────────────────────────
+info "Listening for one job..."
+"${EPHEMERAL_DIR}/run.sh"
+success "Job completed — ephemeral runner exiting."

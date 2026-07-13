@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# =============================================================================
+# slurm_job_wrapper.sh  —  Bridge: GitHub Actions runner → SLURM compute nodes
+#
+# The GitHub Actions runner lives on the LOGIN node (no GPUs).
+# This wrapper is invoked by the runner for every step that needs GPU compute.
+# It submits the real work to a SLURM compute node via srun/sbatch and streams
+# output back to the runner's stdout so Actions sees live logs.
+#
+# Usage (called automatically by ci.yml steps):
+#   bash slurm_job_wrapper.sh [options] -- <command> [args...]
+#
+# Options:
+#   --gpus    <N>          Number of GPUs per node   (default: 1)
+#   --nodes   <N>          Number of nodes           (default: 1)
+#   --ntasks  <N>          Total MPI tasks           (default: same as --gpus)
+#   --time    <HH:MM:SS>   Wall-clock limit          (default: 01:00:00)
+#   --mem     <MB>         Memory per node in MB     (default: 128000)
+#   --part    <name>       SLURM partition            (default: $SLURM_PARTITION or gpu)
+#   --job-name <name>      SLURM job name             (default: gh-runner-job)
+#   --mode    srun|sbatch  Submission mode            (default: srun for interactive)
+#   --tmp-dir <path>       Temp dir for sbatch script (default: /tmp)
+#   --out     <path>       Capture stdout to file     (optional)
+#
+# Environment:
+#   SLURM_PARTITION        Overrides --part default
+#   RUNNER_INSTALL_DIR     Path to runner installation
+#   GH_JOB_ID             GitHub Actions job ID (set by Actions runtime)
+#
+# =============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/runner_env.sh" 2>/dev/null || true
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+N_GPUS=1
+N_NODES=1
+N_TASKS=""          # default = N_GPUS
+WALL_TIME="01:00:00"
+MEM_MB=128000
+PARTITION="${SLURM_PARTITION:-gpu}"
+JOB_NAME="gh-runner-${GH_JOB_ID:-job}"
+MODE="srun"
+TMP_DIR="${TMPDIR:-/tmp}"
+OUT_FILE=""
+CMD_ARGS=()
+
+# ── Colour helpers ────────────────────────────────────────────────────────────
+info()  { echo "[slurm_wrapper] $*"; }
+die()   { echo "[slurm_wrapper][ERROR] $*" >&2; exit 1; }
+
+# ── Parse arguments ───────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gpus)     N_GPUS="$2";     shift 2 ;;
+    --nodes)    N_NODES="$2";    shift 2 ;;
+    --ntasks)   N_TASKS="$2";    shift 2 ;;
+    --time)     WALL_TIME="$2";  shift 2 ;;
+    --mem)      MEM_MB="$2";     shift 2 ;;
+    --part)     PARTITION="$2";  shift 2 ;;
+    --job-name) JOB_NAME="$2";   shift 2 ;;
+    --mode)     MODE="$2";       shift 2 ;;
+    --tmp-dir)  TMP_DIR="$2";    shift 2 ;;
+    --out)      OUT_FILE="$2";   shift 2 ;;
+    --)         shift; CMD_ARGS=("$@"); break ;;
+    *)          CMD_ARGS+=("$1"); shift ;;
+  esac
+done
+
+[[ ${#CMD_ARGS[@]} -eq 0 ]] && die "No command specified. Use: $0 [opts] -- <cmd>"
+[[ -z "$N_TASKS" ]] && N_TASKS=$((N_NODES * N_GPUS))
+
+# ── Validate SLURM availability ───────────────────────────────────────────────
+if ! command -v srun &>/dev/null; then
+  info "SLURM not available — running command locally."
+  exec "${CMD_ARGS[@]}"
+fi
+
+# ── Build env-export string ───────────────────────────────────────────────────
+# Forward CI variables so the compute node sees the same context as the runner
+CI_VARS=(
+  "GITHUB_ACTIONS=true"
+  "GITHUB_WORKSPACE=${GITHUB_WORKSPACE:-}"
+  "GITHUB_SHA=${GITHUB_SHA:-}"
+  "GITHUB_REF=${GITHUB_REF:-}"
+  "GITHUB_RUN_ID=${GITHUB_RUN_ID:-}"
+  "CUDA_HOME=${CUDA_HOME}"
+  "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
+  "PATH=${PATH}"
+)
+if [[ -n "${NCCL_HOME:-}" ]]; then
+  CI_VARS+=("NCCL_HOME=${NCCL_HOME}")
+fi
+EXPORT_STR=$(IFS=,; echo "${CI_VARS[*]}")
+
+# ── srun mode (interactive — logs stream back to Actions in real-time) ─────────
+if [[ "$MODE" == "srun" ]]; then
+  info "Submitting via srun: gpus=${N_GPUS} nodes=${N_NODES} ntasks=${N_TASKS} partition=${PARTITION}"
+  info "Command: ${CMD_ARGS[*]}"
+
+  SRUN_CMD=(
+    srun
+    --partition="${PARTITION}"
+    --nodes="${N_NODES}"
+    --ntasks="${N_TASKS}"
+    --gres="gpu:${N_GPUS}"
+    --time="${WALL_TIME}"
+    --mem="${MEM_MB}M"
+    --job-name="${JOB_NAME}"
+    --export="${EXPORT_STR}"
+    --pty                   # attach pseudo-terminal for colour output
+    --unbuffered
+  )
+
+  if [[ -n "$OUT_FILE" ]]; then
+    "${SRUN_CMD[@]}" "${CMD_ARGS[@]}" 2>&1 | tee "$OUT_FILE"
+  else
+    "${SRUN_CMD[@]}" "${CMD_ARGS[@]}"
+  fi
+
+# ── sbatch mode (fire-and-forget — used by poller for long benchmark runs) ────
+elif [[ "$MODE" == "sbatch" ]]; then
+  BATCH_SCRIPT="${TMP_DIR}/gh_runner_${JOB_NAME}_$$.sh"
+  LOG_FILE="${TMP_DIR}/gh_runner_${JOB_NAME}_$$.log"
+
+  cat > "$BATCH_SCRIPT" <<SBATCH
+#!/usr/bin/env bash
+#SBATCH --job-name=${JOB_NAME}
+#SBATCH --partition=${PARTITION}
+#SBATCH --nodes=${N_NODES}
+#SBATCH --ntasks=${N_TASKS}
+#SBATCH --gres=gpu:${N_GPUS}
+#SBATCH --time=${WALL_TIME}
+#SBATCH --mem=${MEM_MB}M
+#SBATCH --output=${LOG_FILE}
+#SBATCH --error=${LOG_FILE}
+
+set -euo pipefail
+source "${SCRIPT_DIR}/runner_env.sh"
+
+echo "[sbatch] Node: \$(hostname)"
+echo "[sbatch] GPUs visible: \$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | tr '\n' ' ')"
+echo "[sbatch] Starting: ${CMD_ARGS[*]}"
+echo "---"
+
+${CMD_ARGS[*]}
+
+EXIT_CODE=\$?
+echo "---"
+echo "[sbatch] Exit code: \${EXIT_CODE}"
+exit \$EXIT_CODE
+SBATCH
+
+  chmod +x "$BATCH_SCRIPT"
+  info "Submitting batch job to partition '${PARTITION}'..."
+  JOB_ID=$(sbatch --parsable "$BATCH_SCRIPT")
+  info "Submitted SLURM job ID: ${JOB_ID}"
+
+  # Poll until completion
+  info "Waiting for job ${JOB_ID} to finish..."
+  while true; do
+    STATE=$(squeue -j "${JOB_ID}" -h -o "%T" 2>/dev/null || echo "UNKNOWN")
+    case "$STATE" in
+      RUNNING)  info "  Job ${JOB_ID}: RUNNING..." ;;
+      PENDING)  info "  Job ${JOB_ID}: PENDING (queued)..." ;;
+      UNKNOWN|"") break ;;   # job no longer in queue → finished
+      *) info "  Job ${JOB_ID}: ${STATE}" ;;
+    esac
+    sleep 15
+  done
+
+  # Stream log back so Actions sees the output
+  if [[ -f "$LOG_FILE" ]]; then
+    cat "$LOG_FILE"
+    [[ -n "$OUT_FILE" ]] && cp "$LOG_FILE" "$OUT_FILE"
+  fi
+
+  # Extract exit code from sacct
+  RC=$(sacct -j "${JOB_ID}" --format=ExitCode --noheader 2>/dev/null \
+       | head -1 | awk -F: '{print $1}' | tr -d ' ' || echo "0")
+  rm -f "$BATCH_SCRIPT" "$LOG_FILE"
+  exit "${RC:-0}"
+
+else
+  die "Unknown --mode '${MODE}'. Use 'srun' or 'sbatch'."
+fi

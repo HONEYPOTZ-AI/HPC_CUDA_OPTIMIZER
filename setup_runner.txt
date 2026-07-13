@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# =============================================================================
+# setup_runner.sh  —  HPC Optimizer: Self-Hosted GitHub Actions Runner Setup
+#                     for SLURM HPC clusters (login-node install, GPU labels)
+#
+# Usage:
+#   ./setup_runner.sh [--token <RUNNER_TOKEN>] [--url <REPO_URL>]
+#                     [--name <RUNNER_NAME>] [--labels <extra,labels>]
+#                     [--rundir <install_dir>] [--gpus <count>]
+#                     [--uninstall]
+#
+# Environment variables (override defaults):
+#   GH_RUNNER_TOKEN   - GitHub Actions runner registration token
+#   GH_REPO_URL       - Full repo URL, e.g. https://github.com/org/repo
+#   GH_RUNNER_NAME    - Runner name (default: hostname)
+#   GH_RUNNER_VERSION - Actions runner version (default: 2.317.0)
+#   RUNNER_WORKDIR    - Working directory for jobs (default: /scratch/gh-runner/work)
+#   SLURM_PARTITION   - SLURM partition for GPU jobs (default: gpu)
+#   GPU_COUNT         - Number of GPUs per node visible to runner (default: auto-detect)
+#
+# Requirements:
+#   - curl, tar, systemctl (or launchd on macOS)
+#   - SLURM client tools (sbatch, squeue) reachable on PATH
+#   - CUDA toolkit installed (CUDA_HOME or /usr/local/cuda)
+#   - User must have passwordless sudo OR run as root for systemd install
+#
+# =============================================================================
+set -euo pipefail
+
+# ── Colour helpers ────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+info()    { echo -e "${CYAN}[INFO]${RESET}  $*"; }
+success() { echo -e "${GREEN}[OK]${RESET}    $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+die()     { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+GH_RUNNER_VERSION="${GH_RUNNER_VERSION:-2.317.0}"
+GH_RUNNER_NAME="${GH_RUNNER_NAME:-$(hostname -s)}"
+GH_REPO_URL="${GH_REPO_URL:-}"
+GH_RUNNER_TOKEN="${GH_RUNNER_TOKEN:-}"
+RUNNER_INSTALL_DIR="${RUNNER_INSTALL_DIR:-/opt/gh-runner}"
+RUNNER_WORKDIR="${RUNNER_WORKDIR:-/scratch/gh-runner/work}"
+RUNNER_USER="${RUNNER_USER:-$(whoami)}"
+SLURM_PARTITION="${SLURM_PARTITION:-gpu}"
+GPU_COUNT="${GPU_COUNT:-}"
+EXTRA_LABELS="${EXTRA_LABELS:-}"
+UNINSTALL=false
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --token)    GH_RUNNER_TOKEN="$2";      shift 2 ;;
+    --url)      GH_REPO_URL="$2";          shift 2 ;;
+    --name)     GH_RUNNER_NAME="$2";       shift 2 ;;
+    --labels)   EXTRA_LABELS="$2";         shift 2 ;;
+    --rundir)   RUNNER_INSTALL_DIR="$2";   shift 2 ;;
+    --gpus)     GPU_COUNT="$2";            shift 2 ;;
+    --uninstall) UNINSTALL=true;           shift   ;;
+    *) die "Unknown argument: $1. Run with --help for usage." ;;
+  esac
+done
+
+# ── Uninstall path ────────────────────────────────────────────────────────────
+if $UNINSTALL; then
+  info "Uninstalling runner..."
+  bash "${SCRIPTS_DIR}/teardown_runner.sh" --rundir "$RUNNER_INSTALL_DIR"
+  exit 0
+fi
+
+# ── Validate required inputs ──────────────────────────────────────────────────
+[[ -z "$GH_RUNNER_TOKEN" ]] && die "Runner token required. Pass --token or set GH_RUNNER_TOKEN."
+[[ -z "$GH_REPO_URL" ]]    && die "Repo URL required. Pass --url or set GH_REPO_URL."
+
+# ── Detect GPU count ──────────────────────────────────────────────────────────
+if [[ -z "$GPU_COUNT" ]]; then
+  if command -v nvidia-smi &>/dev/null; then
+    GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l || echo 0)
+  else
+    GPU_COUNT=0
+  fi
+fi
+info "Detected ${GPU_COUNT} GPU(s) on this node."
+
+# ── Detect CUDA version ───────────────────────────────────────────────────────
+CUDA_VERSION="none"
+if command -v nvcc &>/dev/null; then
+  CUDA_VERSION=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9.]+' | head -1 || echo "unknown")
+fi
+info "CUDA version: ${CUDA_VERSION}"
+
+# ── Detect GPU architecture labels ────────────────────────────────────────────
+GPU_ARCH_LABELS=""
+if command -v nvidia-smi &>/dev/null; then
+  while IFS= read -r line; do
+    case "$line" in
+      *V100*) GPU_ARCH_LABELS="${GPU_ARCH_LABELS},sm70,volta" ;;
+      *A100*) GPU_ARCH_LABELS="${GPU_ARCH_LABELS},sm80,ampere" ;;
+      *H100*) GPU_ARCH_LABELS="${GPU_ARCH_LABELS},sm90,hopper" ;;
+      *A40*|*A30*) GPU_ARCH_LABELS="${GPU_ARCH_LABELS},sm80" ;;
+    esac
+  done < <(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)
+  GPU_ARCH_LABELS="${GPU_ARCH_LABELS#,}"  # strip leading comma
+fi
+
+# ── Check SLURM availability ──────────────────────────────────────────────────
+SLURM_AVAILABLE=false
+if command -v sbatch &>/dev/null && command -v squeue &>/dev/null; then
+  SLURM_AVAILABLE=true
+  SLURM_VERSION=$(sbatch --version 2>/dev/null | head -1 || echo "unknown")
+  info "SLURM detected: ${SLURM_VERSION}"
+else
+  warn "SLURM client tools not found — runner will execute jobs locally."
+fi
+
+# ── Build runner labels ───────────────────────────────────────────────────────
+LABELS="self-hosted,Linux,X64,hpc,cuda"
+[[ -n "$GPU_ARCH_LABELS" ]] && LABELS="${LABELS},${GPU_ARCH_LABELS}"
+[[ "$GPU_COUNT" -gt 0 ]]   && LABELS="${LABELS},gpu,gpu${GPU_COUNT}x"
+$SLURM_AVAILABLE             && LABELS="${LABELS},slurm"
+[[ -n "$EXTRA_LABELS" ]]   && LABELS="${LABELS},${EXTRA_LABELS}"
+info "Runner labels: ${LABELS}"
+
+# ── Create install directory ──────────────────────────────────────────────────
+info "Installing runner to: ${RUNNER_INSTALL_DIR}"
+mkdir -p "${RUNNER_INSTALL_DIR}" "${RUNNER_WORKDIR}"
+
+# ── Download runner binary ────────────────────────────────────────────────────
+RUNNER_ARCHIVE="actions-runner-linux-x64-${GH_RUNNER_VERSION}.tar.gz"
+RUNNER_URL="https://github.com/actions/runner/releases/download/v${GH_RUNNER_VERSION}/${RUNNER_ARCHIVE}"
+
+if [[ ! -f "${RUNNER_INSTALL_DIR}/config.sh" ]]; then
+  info "Downloading GitHub Actions runner v${GH_RUNNER_VERSION}..."
+  curl -fsSL -o "/tmp/${RUNNER_ARCHIVE}" "${RUNNER_URL}" \
+    || die "Failed to download runner binary from ${RUNNER_URL}"
+  tar -xzf "/tmp/${RUNNER_ARCHIVE}" -C "${RUNNER_INSTALL_DIR}"
+  rm -f "/tmp/${RUNNER_ARCHIVE}"
+  success "Runner binary extracted."
+else
+  info "Runner binary already present — skipping download."
+fi
+
+# ── Copy helper scripts ───────────────────────────────────────────────────────
+info "Installing helper scripts..."
+cp -f "${SCRIPTS_DIR}/runner_env.sh"          "${RUNNER_INSTALL_DIR}/"
+cp -f "${SCRIPTS_DIR}/slurm_job_wrapper.sh"   "${RUNNER_INSTALL_DIR}/"
+cp -f "${SCRIPTS_DIR}/ephemeral_runner.sh"    "${RUNNER_INSTALL_DIR}/"
+cp -f "${SCRIPTS_DIR}/runner_poller.sh"       "${RUNNER_INSTALL_DIR}/"
+cp -f "${SCRIPTS_DIR}/teardown_runner.sh"     "${RUNNER_INSTALL_DIR}/"
+chmod +x "${RUNNER_INSTALL_DIR}"/*.sh
+
+# ── Write runner configuration file ──────────────────────────────────────────
+cat > "${RUNNER_INSTALL_DIR}/.runner_config" <<EOF
+GH_REPO_URL="${GH_REPO_URL}"
+GH_RUNNER_NAME="${GH_RUNNER_NAME}"
+RUNNER_LABELS="${LABELS}"
+RUNNER_INSTALL_DIR="${RUNNER_INSTALL_DIR}"
+RUNNER_WORKDIR="${RUNNER_WORKDIR}"
+RUNNER_USER="${RUNNER_USER}"
+SLURM_PARTITION="${SLURM_PARTITION}"
+GPU_COUNT="${GPU_COUNT}"
+CUDA_VERSION="${CUDA_VERSION}"
+EOF
+success "Configuration saved to ${RUNNER_INSTALL_DIR}/.runner_config"
+
+# ── Register runner with GitHub ───────────────────────────────────────────────
+info "Registering runner '${GH_RUNNER_NAME}' with GitHub..."
+cd "${RUNNER_INSTALL_DIR}"
+
+# Source environment so nvcc/cmake are on PATH during registration
+# shellcheck source=runner_env.sh
+source "${RUNNER_INSTALL_DIR}/runner_env.sh" 2>/dev/null || true
+
+./config.sh \
+  --url "${GH_REPO_URL}" \
+  --token "${GH_RUNNER_TOKEN}" \
+  --name "${GH_RUNNER_NAME}" \
+  --labels "${LABELS}" \
+  --work "${RUNNER_WORKDIR}" \
+  --replace \
+  --unattended
+success "Runner registered successfully."
+
+# ── Install systemd service ───────────────────────────────────────────────────
+SERVICE_NAME="github-runner-hpc"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+info "Installing systemd service: ${SERVICE_NAME}..."
+cat > "/tmp/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=GitHub Actions Self-Hosted HPC Runner (${GH_RUNNER_NAME})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${RUNNER_USER}
+WorkingDirectory=${RUNNER_INSTALL_DIR}
+EnvironmentFile=-${RUNNER_INSTALL_DIR}/runner_env.sh
+ExecStartPre=/bin/bash -c 'source ${RUNNER_INSTALL_DIR}/runner_env.sh'
+ExecStart=${RUNNER_INSTALL_DIR}/run.sh
+ExecStop=/bin/kill -SIGTERM \$MAINPID
+Restart=on-failure
+RestartSec=10
+KillMode=process
+TimeoutStopSec=60
+StandardOutput=append:${RUNNER_INSTALL_DIR}/runner.log
+StandardError=append:${RUNNER_INSTALL_DIR}/runner.log
+
+# Resource limits — keep the listener lightweight on the login node
+LimitNOFILE=65536
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+if [[ $EUID -eq 0 ]]; then
+  cp "/tmp/${SERVICE_NAME}.service" "${SERVICE_FILE}"
+  systemctl daemon-reload
+  systemctl enable "${SERVICE_NAME}"
+  systemctl start  "${SERVICE_NAME}"
+  success "Systemd service installed and started."
+elif command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+  sudo cp "/tmp/${SERVICE_NAME}.service" "${SERVICE_FILE}"
+  sudo systemctl daemon-reload
+  sudo systemctl enable "${SERVICE_NAME}"
+  sudo systemctl start  "${SERVICE_NAME}"
+  success "Systemd service installed and started (via sudo)."
+else
+  warn "Cannot install systemd service without sudo/root."
+  warn "Copy /tmp/${SERVICE_NAME}.service to /etc/systemd/system/ manually,"
+  warn "then run: sudo systemctl daemon-reload && sudo systemctl enable --now ${SERVICE_NAME}"
+fi
+rm -f "/tmp/${SERVICE_NAME}.service"
+
+# ── Install poller cron job ───────────────────────────────────────────────────
+info "Installing runner poller cron job (every 2 minutes)..."
+CRON_CMD="*/2 * * * * bash ${RUNNER_INSTALL_DIR}/runner_poller.sh >> ${RUNNER_INSTALL_DIR}/poller.log 2>&1"
+( crontab -l 2>/dev/null | grep -v "runner_poller.sh"; echo "$CRON_CMD" ) | crontab -
+success "Poller cron installed."
+
+# ── Health check ─────────────────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}════════════════════════════════════════════════${RESET}"
+echo -e "${GREEN}  HPC Runner Setup Complete${RESET}"
+echo -e "${BOLD}════════════════════════════════════════════════${RESET}"
+echo -e "  Runner name  : ${BOLD}${GH_RUNNER_NAME}${RESET}"
+echo -e "  Labels       : ${LABELS}"
+echo -e "  Install dir  : ${RUNNER_INSTALL_DIR}"
+echo -e "  Work dir     : ${RUNNER_WORKDIR}"
+echo -e "  GPUs         : ${GPU_COUNT}"
+echo -e "  CUDA         : ${CUDA_VERSION}"
+echo -e "  SLURM        : ${SLURM_AVAILABLE}"
+echo -e "  Partition    : ${SLURM_PARTITION}"
+echo -e "${BOLD}════════════════════════════════════════════════${RESET}"
+echo ""
+echo -e "  Verify status : ${CYAN}systemctl status ${SERVICE_NAME}${RESET}"
+echo -e "  View logs     : ${CYAN}tail -f ${RUNNER_INSTALL_DIR}/runner.log${RESET}"
+echo -e "  Poller logs   : ${CYAN}tail -f ${RUNNER_INSTALL_DIR}/poller.log${RESET}"
+echo -e "  Uninstall     : ${CYAN}$0 --uninstall${RESET}"
+echo ""

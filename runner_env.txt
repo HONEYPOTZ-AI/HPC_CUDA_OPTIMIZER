@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# =============================================================================
+# runner_env.sh  —  Environment shim sourced before every GitHub Actions job
+#                   on the HPC self-hosted runner.
+#
+# Source this file, do NOT execute it directly:
+#   source /opt/gh-runner/runner_env.sh
+#
+# This file is automatically sourced by:
+#   - setup_runner.sh  (during registration)
+#   - The systemd ExecStartPre hook
+#   - slurm_job_wrapper.sh (before srun/sbatch dispatch)
+#   - ephemeral_runner.sh  (inside compute nodes)
+# =============================================================================
+
+# ── CUDA ──────────────────────────────────────────────────────────────────────
+# Try common install locations; prefer env-module-set CUDA_HOME if present.
+if [[ -z "${CUDA_HOME:-}" ]]; then
+  for _cuda_try in /usr/local/cuda /usr/local/cuda-12.3 /usr/local/cuda-12.2 \
+                   /usr/local/cuda-12.1 /usr/local/cuda-11.8 /opt/cuda; do
+    if [[ -d "$_cuda_try" ]]; then
+      CUDA_HOME="$_cuda_try"
+      break
+    fi
+  done
+fi
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+export PATH="${CUDA_HOME}/bin:${PATH}"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${CUDA_HOME}/lib:${LD_LIBRARY_PATH:-}"
+
+# ── NCCL ──────────────────────────────────────────────────────────────────────
+if [[ -z "${NCCL_HOME:-}" ]]; then
+  for _nccl_try in /usr/local/nccl /opt/nccl "${CUDA_HOME}"; do
+    if [[ -d "${_nccl_try}/include/nccl.h" || -f "${_nccl_try}/include/nccl.h" ]]; then
+      NCCL_HOME="$_nccl_try"
+      break
+    fi
+  done
+fi
+if [[ -n "${NCCL_HOME:-}" ]]; then
+  export NCCL_HOME
+  export LD_LIBRARY_PATH="${NCCL_HOME}/lib:${LD_LIBRARY_PATH}"
+fi
+# NCCL tuning for A100/H100 NVLink
+export NCCL_IB_DISABLE=0
+export NCCL_NET_GDR_LEVEL=2
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+
+# ── MPI (OpenMPI or MVAPICH2) ─────────────────────────────────────────────────
+if [[ -z "${MPI_HOME:-}" ]]; then
+  for _mpi_try in /usr/local/openmpi /opt/openmpi /usr/lib/openmpi \
+                   /usr/local/mvapich2 /opt/mvapich2; do
+    if [[ -d "$_mpi_try/bin" ]]; then
+      MPI_HOME="$_mpi_try"
+      break
+    fi
+  done
+fi
+if [[ -n "${MPI_HOME:-}" ]]; then
+  export MPI_HOME
+  export PATH="${MPI_HOME}/bin:${PATH}"
+  export LD_LIBRARY_PATH="${MPI_HOME}/lib:${LD_LIBRARY_PATH}"
+fi
+
+# ── CMake (prefer ≥ 3.25 for CUDA language support) ──────────────────────────
+if [[ -z "${CMAKE_HOME:-}" ]]; then
+  for _cmake_try in /usr/local/cmake /opt/cmake /usr/local; do
+    if [[ -x "${_cmake_try}/bin/cmake" ]]; then
+      CMAKE_HOME="$_cmake_try"
+      break
+    fi
+  done
+fi
+if [[ -n "${CMAKE_HOME:-}" ]]; then
+  export CMAKE_HOME
+  export PATH="${CMAKE_HOME}/bin:${PATH}"
+fi
+
+# ── cuBLAS / cuDNN (usually bundled with CUDA) ────────────────────────────────
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64/stubs:${LD_LIBRARY_PATH}"
+
+# ── NVTX (for profiler annotations) ──────────────────────────────────────────
+export NVTX_HOME="${NVTX_HOME:-${CUDA_HOME}}"
+
+# ── Python / pip (for test harnesses) ────────────────────────────────────────
+if command -v python3 &>/dev/null; then
+  export PYTHON="${PYTHON:-$(command -v python3)}"
+fi
+
+# ── SLURM passthrough variables ───────────────────────────────────────────────
+# These are forwarded into SLURM batch jobs so GPU workers see the same env.
+export SLURM_EXPORT_ENV="${SLURM_EXPORT_ENV:-CUDA_HOME,NCCL_HOME,MPI_HOME,PATH,LD_LIBRARY_PATH,NCCL_IB_DISABLE,NCCL_NET_GDR_LEVEL}"
+
+# ── GitHub Actions runner internal ───────────────────────────────────────────
+# Ensure the runner process does not inherit stale CUDA_VISIBLE_DEVICES
+# (the wrapper scripts set this per-job).
+unset CUDA_VISIBLE_DEVICES 2>/dev/null || true
+
+# ── Friendly summary (only when sourced interactively) ───────────────────────
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]] && [[ -t 1 ]]; then
+  echo "[runner_env] CUDA_HOME=${CUDA_HOME}"
+  echo "[runner_env] NCCL_HOME=${NCCL_HOME:-<not found>}"
+  echo "[runner_env]  MPI_HOME=${MPI_HOME:-<not found>}"
+  echo "[runner_env]   CC/nvcc=$(command -v nvcc 2>/dev/null || echo '<not on PATH>')"
+  echo "[runner_env]   cmake=$(command -v cmake 2>/dev/null || echo '<not on PATH>')"
+fi
