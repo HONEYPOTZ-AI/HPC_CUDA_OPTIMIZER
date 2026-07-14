@@ -52,6 +52,12 @@ EPHEMERAL_MEM="${EPHEMERAL_MEM:-128000}"
 POLL_LABELS_FILTER="${POLL_LABELS_FILTER:-self-hosted,hpc}"
 SLURM_PARTITION="${SLURM_PARTITION:-gpu}"
 GH_REPO_URL="${GH_REPO_URL:-}"
+# ── Validate repo URL ───────────────────────────────────────────────────────
+if [[ -z "${GH_REPO_URL:-}" ]]; then
+  warn "GH_REPO_URL not set — cannot determine repo. Set GH_REPO_URL in ${RUNNER_INSTALL_DIR}/.runner_config or environment."
+  exit 0
+fi
+
 LOCK_FILE="/tmp/gh_runner_poller.lock"
 
 # ── Parse repo owner/name from URL ───────────────────────────────────────────
