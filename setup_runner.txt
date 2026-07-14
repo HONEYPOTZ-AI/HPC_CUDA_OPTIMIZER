@@ -170,7 +170,7 @@ info "Registering runner '${GH_RUNNER_NAME}' with GitHub..."
 cd "${RUNNER_INSTALL_DIR}"
 
 # Source environment so nvcc/cmake are on PATH during registration
-# shellcheck source=runner_env.sh
+# shellcheck source=/opt/gh-runner/runner_env.sh
 source "${RUNNER_INSTALL_DIR}/runner_env.sh" 2>/dev/null || true
 
 ./config.sh \

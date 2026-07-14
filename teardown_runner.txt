@@ -42,6 +42,7 @@ done
 
 # ── Load config ───────────────────────────────────────────────────────────────
 CONFIG_FILE="${RUNNER_INSTALL_DIR}/.runner_config"
+# shellcheck source=/opt/gh-runner/.runner_config
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 RUNNER_WORKDIR="${RUNNER_WORKDIR:-/scratch/gh-runner/work}"
 
@@ -116,9 +117,11 @@ if [[ -f "${RUNNER_INSTALL_DIR}/config.sh" ]]; then
   info "De-registering runner from GitHub..."
   cd "${RUNNER_INSTALL_DIR}"
   if [[ -n "$REMOVAL_TOKEN" ]]; then
-    ./config.sh remove --unattended --token "$REMOVAL_TOKEN" 2>/dev/null \
-      && success "Runner de-registered." \
-      || warn "De-registration failed (token may have expired). Remove manually in GitHub repo Settings → Actions → Runners."
+    if ./config.sh remove --unattended --token "$REMOVAL_TOKEN" 2>/dev/null; then
+      success "Runner de-registered."
+    else
+      warn "De-registration failed (token may have expired). Remove manually in GitHub repo Settings → Actions → Runners."
+    fi
   else
     warn "No removal token — runner will appear offline in GitHub."
     warn "Remove it manually: Repo Settings → Actions → Runners → Remove."

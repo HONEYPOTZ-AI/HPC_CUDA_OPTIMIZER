@@ -26,6 +26,7 @@ set -euo pipefail
 
 # ── Load config ───────────────────────────────────────────────────────────────
 CONFIG_FILE="${RUNNER_INSTALL_DIR:-/opt/gh-runner}/.runner_config"
+# shellcheck source=/opt/gh-runner/.runner_config
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 RUNNER_INSTALL_DIR="${RUNNER_INSTALL_DIR:-/opt/gh-runner}"
@@ -37,7 +38,8 @@ GH_PAT="${GH_PAT:-}"
 if [[ -z "$GH_PAT" ]]; then
   # Try reading from a secrets file (chmod 600, owned by runner user)
   SECRETS_FILE="${RUNNER_INSTALL_DIR}/.gh_secrets"
-  [[ -f "$SECRETS_FILE" ]] && source "$SECRETS_FILE"
+  # shellcheck source=/opt/gh-runner/.gh_secrets
+[[ -f "$SECRETS_FILE" ]] && source "$SECRETS_FILE"
 fi
 if [[ -z "${GH_PAT:-}" ]]; then
   echo "[poller][WARN] GH_PAT not set — cannot poll GitHub API. Set GH_PAT in environment or ${RUNNER_INSTALL_DIR}/.gh_secrets"
