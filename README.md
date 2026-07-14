@@ -368,6 +368,20 @@ Drop-in placement:
 scripts/
   check_regression.py              ← called by ci.yml and benchmark.yml
 
+  New Job 7 — regression-check (inserted between benchmark and the old ci-gate)
+
+  | Aspect | Detail |
+| --- | --- |
+| **Trigger** | Every PR + every push to ``main`` |
+| **Depends on** | ``test`` (waits for all 4 suites to pass) |
+| **Runner** | ``[self-hosted, ``hpc, ``slurm, ``gpu, ``ampere]`` — A100 for accurate numbers |
+| **What it runs** | Builds ``test_hpc_optimizers``, runs only the ``ThroughputBenchmark`` CTest filter (test #12), then calls ``check_regression.py ``--threshold-pct ``5.0`` |
+| **PR comment** | Sticky — finds the existing bot comment by HTML marker and **updates** it instead of posting a new one on every push |
+| **On regression** | Exits non-zero → ``ci-gate`` catches it → merge blocked |
+| **Artifacts** | ``throughput_bench.log``, ``regression_table.md``, ``regression_summary.json`` (30-day retention) |
+
+Updated Job 8 — ci-gate now lists regression-check in its needs: array and prints its result in the status summary, so a regression is a hard merge blocker just like a failed unit test.
+
 
 
 
