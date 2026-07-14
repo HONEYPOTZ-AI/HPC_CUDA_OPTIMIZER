@@ -97,7 +97,7 @@ fi
 # ── Fetch removal token from API if PAT available ────────────────────────────
 if [[ -z "$REMOVAL_TOKEN" ]] && [[ -n "${GH_PAT:-}" ]] && [[ -n "${GH_REPO_URL:-}" ]]; then
   info "Fetching removal token from GitHub API..."
-  GH_ORG_REPO=$(echo "${GH_REPO_URL}" | sed 's|https://github.com/||')
+  GH_ORG_REPO=${GH_REPO_URL#https://github.com/}
   REMOVAL_TOKEN=$(curl -sSf -X POST \
     -H "Authorization: Bearer ${GH_PAT}" \
     -H "Accept: application/vnd.github+json" \
