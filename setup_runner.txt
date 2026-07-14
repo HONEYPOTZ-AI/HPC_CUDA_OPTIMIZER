@@ -199,6 +199,7 @@ Type=simple
 User=${RUNNER_USER}
 WorkingDirectory=${RUNNER_INSTALL_DIR}
 EnvironmentFile=-${RUNNER_INSTALL_DIR}/runner_env.sh
+# shellcheck source=/opt/gh-runner/runner_env.sh
 ExecStartPre=/bin/bash -c 'source ${RUNNER_INSTALL_DIR}/runner_env.sh'
 ExecStart=${RUNNER_INSTALL_DIR}/run.sh
 ExecStop=/bin/kill -SIGTERM \$MAINPID

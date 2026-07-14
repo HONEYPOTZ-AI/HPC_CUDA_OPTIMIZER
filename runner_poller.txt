@@ -29,6 +29,7 @@ CONFIG_FILE="${RUNNER_INSTALL_DIR:-/opt/gh-runner}/.runner_config"
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 RUNNER_INSTALL_DIR="${RUNNER_INSTALL_DIR:-/opt/gh-runner}"
+# shellcheck source=/opt/gh-runner/runner_env.sh
 source "${RUNNER_INSTALL_DIR}/runner_env.sh" 2>/dev/null || true
 
 # ── Required: GitHub PAT ──────────────────────────────────────────────────────
@@ -61,7 +62,7 @@ fi
 LOCK_FILE="/tmp/gh_runner_poller.lock"
 
 # ── Parse repo owner/name from URL ───────────────────────────────────────────
-GH_ORG_REPO=$(echo "${GH_REPO_URL}" | sed 's|https://github.com/||')
+GH_ORG_REPO=${GH_REPO_URL#https://github.com/}
 GH_API_BASE="https://api.github.com/repos/${GH_ORG_REPO}"
 
 ts()   { date '+%Y-%m-%d %H:%M:%S'; }
