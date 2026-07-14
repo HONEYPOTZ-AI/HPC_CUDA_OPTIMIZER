@@ -1,0 +1,486 @@
+name: HPC Optimizer Nightly Benchmark
+
+on:
+  schedule:
+    # 02:00 UTC every night (22:00 EDT)
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      world_size:
+        description: "Max GPUs for scaling benchmark (1|2|4|8)"
+        required: false
+        default: "8"
+      update_baseline:
+        description: "Overwrite baseline on main (true|false)"
+        required: false
+        default: "false"
+        type: boolean
+      optimizer_filter:
+        description: "Comma-separated optimizer list (empty = all)"
+        required: false
+        default: ""
+
+# Cancel stale nightly if a manual re-run lands while it is running
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BASELINE_PATH: .github/benchmark_baseline.json
+  RESULTS_DIR:   benchmark_results
+  HPC_LIB_ROOT:  ${{ github.workspace }}
+  CUDA_ARCH:     "80"        # A100 default; override per cluster in runner_env.sh
+  BUILD_TYPE:    Release
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1 — Build the benchmark binaries (Release, sm_80)
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  build:
+    name: "Build Benchmark Binaries"
+    runs-on: [self-hosted, hpc, slurm]
+    timeout-minutes: 30
+    outputs:
+      build_dir: ${{ steps.paths.outputs.build_dir }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Source HPC environment
+        run: source scripts/runner_env.sh 2>/dev/null || true
+
+      - id: paths
+        name: Resolve build directory
+        run: |
+          BUILD_DIR="${{ runner.temp }}/hpc_bench_build"
+          echo "build_dir=${BUILD_DIR}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$BUILD_DIR"
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B "${{ steps.paths.outputs.build_dir }}" \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ env.CUDA_ARCH }}" \
+            -DHPC_ENABLE_NCCL=ON \
+            -DHPC_ENABLE_MPI=ON  \
+            -DHPC_ENABLE_NVTX=ON \
+            -DHPC_ENABLE_CUBLAS=ON \
+            -DCMAKE_GENERATOR=Ninja \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Build all targets
+        run: |
+          cmake --build "${{ steps.paths.outputs.build_dir }}" \
+            --config ${{ env.BUILD_TYPE }} \
+            --target train_single train_zero2 train_zero3_tp \
+            -j$(nproc)
+
+      - name: Upload binaries as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-binaries-${{ github.sha }}
+          path: |
+            ${{ steps.paths.outputs.build_dir }}/examples/train_single
+            ${{ steps.paths.outputs.build_dir }}/examples/train_zero2
+            ${{ steps.paths.outputs.build_dir }}/examples/train_zero3_tp
+          retention-days: 3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 2 — Single-GPU optimizer throughput (all 5 optimizers, FP32 + BF16)
+# ─────────────────────────────────────────────────────────────────────────────
+  bench_single_gpu:
+    name: "Single-GPU Optimizer Throughput"
+    needs: build
+    runs-on: [self-hosted, hpc, gpu, slurm]
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-binaries-${{ github.sha }}
+          path: bench_bins
+
+      - name: Set executable bits
+        run: chmod +x bench_bins/examples/*
+
+      - name: Source HPC environment
+        run: source scripts/runner_env.sh 2>/dev/null || true
+
+      - name: Run single-GPU throughput benchmark
+        run: |
+          mkdir -p ${{ env.RESULTS_DIR }}
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 1 --nodes 1 \
+            --time 00:30:00 \
+            --job-name bench-single \
+            --mode srun \
+            -- bash -c '
+              set -e
+              source scripts/runner_env.sh 2>/dev/null || true
+
+              FILTER="${{ github.event.inputs.optimizer_filter }}"
+              TRAIN=bench_bins/examples/train_single
+              OUT=${{ env.RESULTS_DIR }}/single_gpu.log
+
+              echo "[benchmark] train_single start $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee "$OUT"
+              # train_single prints lines like:
+              #   [BENCH] adamw_vec4  100M FP32  ms_per_step=1.05  bandwidth_GBps=1847
+              #   [BENCH] lion_vec4   100M FP32  ms_per_step=0.83  bandwidth_GBps=1876
+              "$TRAIN" --benchmark --steps 200 --warmup 50 \
+                --params 100000000 --dtype fp32 2>&1 | tee -a "$OUT"
+              "$TRAIN" --benchmark --steps 200 --warmup 50 \
+                --params 100000000 --dtype bf16 2>&1 | tee -a "$OUT"
+
+              echo "[benchmark] train_single done $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$OUT"
+            '
+
+      - name: Upload single-GPU results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-single-${{ github.sha }}
+          path: ${{ env.RESULTS_DIR }}/single_gpu.log
+          retention-days: 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 3 — ZeRO-2 scaling benchmark (1 / 2 / 4 / 8 GPU)
+# ─────────────────────────────────────────────────────────────────────────────
+  bench_zero2_scaling:
+    name: "ZeRO-2 Multi-GPU Scaling"
+    needs: build
+    runs-on: [self-hosted, hpc, gpu, slurm]
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        world_size: [1, 2, 4, 8]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Skip if world_size exceeds input cap
+        id: skip_check
+        run: |
+          MAX="${{ github.event.inputs.world_size || '8' }}"
+          WS="${{ matrix.world_size }}"
+          if (( WS > MAX )); then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download binaries
+        if: steps.skip_check.outputs.skip == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-binaries-${{ github.sha }}
+          path: bench_bins
+
+      - name: Set executable bits
+        if: steps.skip_check.outputs.skip == 'false'
+        run: chmod +x bench_bins/examples/*
+
+      - name: Source HPC environment
+        if: steps.skip_check.outputs.skip == 'false'
+        run: source scripts/runner_env.sh 2>/dev/null || true
+
+      - name: Run ZeRO-2 scaling — ${{ matrix.world_size }} GPU(s)
+        if: steps.skip_check.outputs.skip == 'false'
+        run: |
+          mkdir -p ${{ env.RESULTS_DIR }}
+          WS="${{ matrix.world_size }}"
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus "${WS}" --nodes 1 \
+            --ntasks "${WS}" \
+            --time 00:45:00 \
+            --job-name "bench-zero2-${WS}gpu" \
+            --mode srun \
+            -- bash -c "
+              set -e
+              source scripts/runner_env.sh 2>/dev/null || true
+              TRAIN=bench_bins/examples/train_zero2
+              OUT=${{ env.RESULTS_DIR }}/zero2_${WS}gpu.log
+
+              echo '[benchmark] ZeRO-2 ${WS}-GPU start' | tee \"\$OUT\"
+              # Launches with torchrun / mpirun depending on MPI availability
+              if command -v mpirun &>/dev/null; then
+                mpirun -np ${WS} \"\$TRAIN\" \
+                  --benchmark --steps 100 --warmup 20 \
+                  --params 608000000 --dtype bf16 \
+                  --zero-stage 2 2>&1 | tee -a \"\$OUT\"
+              else
+                torchrun --nproc_per_node=${WS} \"\$TRAIN\" \
+                  --benchmark --steps 100 --warmup 20 \
+                  --params 608000000 --dtype bf16 \
+                  --zero-stage 2 2>&1 | tee -a \"\$OUT\"
+              fi
+              echo '[benchmark] ZeRO-2 ${WS}-GPU done' | tee -a \"\$OUT\"
+            "
+
+      - name: Upload ZeRO-2 results
+        if: steps.skip_check.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-zero2-${{ matrix.world_size }}gpu-${{ github.sha }}
+          path: ${{ env.RESULTS_DIR }}/zero2_${{ matrix.world_size }}gpu.log
+          retention-days: 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 4 — Memory audit (ZeRO-0 → ZeRO-3 per-rank footprint verification)
+# ─────────────────────────────────────────────────────────────────────────────
+  bench_memory_audit:
+    name: "ZeRO Memory Audit"
+    needs: build
+    runs-on: [self-hosted, hpc, gpu, slurm]
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-binaries-${{ github.sha }}
+          path: bench_bins
+
+      - name: Set executable bits
+        run: chmod +x bench_bins/examples/*
+
+      - name: Source HPC environment
+        run: source scripts/runner_env.sh 2>/dev/null || true
+
+      - name: Memory audit — ZeRO-0 vs ZeRO-2 vs ZeRO-3
+        run: |
+          mkdir -p ${{ env.RESULTS_DIR }}
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 1 --nodes 1 \
+            --time 00:20:00 \
+            --job-name bench-mem-audit \
+            --mode srun \
+            -- bash -c '
+              set -e
+              source scripts/runner_env.sh 2>/dev/null || true
+
+              TRAIN_Z2=bench_bins/examples/train_zero2
+              TRAIN_Z3=bench_bins/examples/train_zero3_tp
+              OUT=${{ env.RESULTS_DIR }}/memory_audit.log
+
+              echo "[memory_audit] start $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee "$OUT"
+
+              for STAGE in 0 2; do
+                echo "--- ZeRO-${STAGE} ---" | tee -a "$OUT"
+                nvidia-smi --query-gpu=memory.used --format=csv,noheader >> "$OUT" 2>&1 || true
+                "$TRAIN_Z2" --memory-audit --params 608000000 --dtype bf16 \
+                  --zero-stage "$STAGE" --steps 5 2>&1 | tee -a "$OUT"
+              done
+
+              echo "--- ZeRO-3 (via train_zero3_tp) ---" | tee -a "$OUT"
+              "$TRAIN_Z3" --memory-audit --params 608000000 --dtype bf16 \
+                --zero-stage 3 --steps 5 2>&1 | tee -a "$OUT"
+
+              echo "[memory_audit] done $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$OUT"
+            '
+
+      - name: Upload memory audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-memory-${{ github.sha }}
+          path: ${{ env.RESULTS_DIR }}/memory_audit.log
+          retention-days: 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 5 — Regression analysis + PR comment
+# ─────────────────────────────────────────────────────────────────────────────
+  regression_check:
+    name: "Regression Analysis & PR Comment"
+    needs: [bench_single_gpu, bench_zero2_scaling, bench_memory_audit]
+    runs-on: [self-hosted, hpc, slurm]
+    timeout-minutes: 20
+    # Always run even if scaling jobs were skipped
+    if: always()
+
+    permissions:
+      pull-requests: write
+      contents:      write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all benchmark artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*-${{ github.sha }}
+          path: ${{ env.RESULTS_DIR }}
+          merge-multiple: true
+
+      - name: List collected log files
+        run: find ${{ env.RESULTS_DIR }} -name "*.log" | sort
+
+      - name: Run regression check + generate Markdown table
+        id: regression
+        run: |
+          set +e   # allow non-zero exit; capture it below
+          python3 scripts/check_regression.py \
+            --baseline   "${{ env.BASELINE_PATH }}" \
+            --results-dir "${{ env.RESULTS_DIR }}" \
+            --output-markdown "${{ env.RESULTS_DIR }}/regression_table.md" \
+            --output-json    "${{ env.RESULTS_DIR }}/regression_summary.json" \
+            --threshold-pct  5.0
+          EXIT_CODE=$?
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+
+          # Embed Markdown table in step summary
+          if [[ -f "${{ env.RESULTS_DIR }}/regression_table.md" ]]; then
+            cat "${{ env.RESULTS_DIR }}/regression_table.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          exit $EXIT_CODE
+
+      - name: Read Markdown table for PR comment
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        id: read_table
+        run: |
+          TABLE_FILE="${{ env.RESULTS_DIR }}/regression_table.md"
+          if [[ -f "$TABLE_FILE" ]]; then
+            # Pass multi-line content safely via env
+            {
+              echo 'BENCH_TABLE<<HEREDOC'
+              cat "$TABLE_FILE"
+              echo 'HEREDOC'
+            } >> "$GITHUB_ENV"
+          fi
+
+      - name: Post PR comment with benchmark table
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const body = `## 📊 HPC Optimizer Benchmark Results\n\n` +
+              `**Commit:** \`${{ github.sha }}\`  \n` +
+              `**Branch:** \`${{ github.ref_name }}\`  \n` +
+              `**Runner:** A100 80GB SXM4  \n\n` +
+              `${process.env.BENCH_TABLE || '_No results table generated._'}\n\n` +
+              `> Nightly baseline: \`.github/benchmark_baseline.json\`  \n` +
+              `> Regression threshold: **5 %** latency increase / throughput decrease`;
+
+            // Find existing bot comment to update instead of spam
+            const {data: comments} = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' &&
+              c.body.includes('HPC Optimizer Benchmark Results'));
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: botComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Update baseline on main branch merge
+        if: |
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          (github.event.inputs.update_baseline == 'true' ||
+           steps.regression.outputs.exit_code == '0')
+        run: |
+          # Only promote current results to baseline if no regressions
+          if [[ "${{ steps.regression.outputs.exit_code }}" == "0" ]]; then
+            python3 scripts/check_regression.py \
+              --baseline     "${{ env.BASELINE_PATH }}" \
+              --results-dir  "${{ env.RESULTS_DIR }}" \
+              --promote-baseline "${{ env.BASELINE_PATH }}"
+            echo "Baseline updated from clean benchmark run."
+          else
+            echo "Regressions detected — baseline NOT updated."
+          fi
+
+      - name: Commit updated baseline
+        if: |
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          steps.regression.outputs.exit_code == '0'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = '.github/benchmark_baseline.json';
+            const content = fs.readFileSync(path, 'utf8');
+            const encoded = Buffer.from(content).toString('base64');
+
+            const {data: fileData} = await github.rest.repos.getContent({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              path,
+              ref:   context.sha,
+            });
+
+            await github.rest.repos.createOrUpdateFileContents({
+              owner:   context.repo.owner,
+              repo:    context.repo.repo,
+              path,
+              message: `ci: update benchmark baseline [${context.sha.slice(0,7)}]`,
+              content: encoded,
+              sha:     fileData.sha,
+              branch:  'main',
+            });
+
+      - name: Upload full regression summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-summary-${{ github.sha }}
+          path: |
+            ${{ env.RESULTS_DIR }}/regression_table.md
+            ${{ env.RESULTS_DIR }}/regression_summary.json
+          retention-days: 30
+
+      - name: Fail CI on regression
+        if: steps.regression.outputs.exit_code != '0'
+        run: |
+          echo "::error::Performance regression detected! See the benchmark table in the PR comment or step summary."
+          exit 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 6 — CI gate (required status check for branch protection)
+# ─────────────────────────────────────────────────────────────────────────────
+  benchmark_gate:
+    name: "Benchmark Gate"
+    needs: regression_check
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check result
+        run: |
+          RESULT="${{ needs.regression_check.result }}"
+          if [[ "$RESULT" == "success" ]]; then
+            echo "All benchmarks passed — no regressions."
+          else
+            echo "::error::Benchmark or regression check failed (result: ${RESULT})."
+            exit 1
+          fi

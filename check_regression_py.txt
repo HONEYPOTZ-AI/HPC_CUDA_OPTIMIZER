@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""
+check_regression.py — HPC Optimizer benchmark regression checker.
+
+Reads a JSON baseline file and a directory of benchmark log files,
+extracts current metrics, compares against baseline, and outputs:
+  • Exit code 0  → no regressions
+  • Exit code 1  → one or more regressions exceed threshold
+  • --output-markdown <file>  → Markdown table for GitHub PR comments
+  • --output-json <file>      → machine-readable regression summary
+  • --promote-baseline <file> → overwrite baseline with current results
+
+Usage:
+  python3 check_regression.py \\
+      --baseline   .github/benchmark_baseline.json \\
+      --results-dir benchmark_results/ \\
+      --output-markdown benchmark_results/regression_table.md \\
+      --output-json    benchmark_results/regression_summary.json \\
+      --threshold-pct  5.0
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import sys
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    format="[check_regression] %(levelname)s  %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data structures
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class MetricResult:
+    """One metric comparison row."""
+    section:       str        # e.g. "single_gpu_fp32"
+    metric_key:    str        # e.g. "adamw_vec4"
+    sub_key:       str        # e.g. "ms_per_step" or "throughput_samples_per_sec"
+    baseline_val:  float
+    current_val:   float
+    higher_is_better: bool
+    delta_pct:     float      # positive = improvement when higher_is_better matches direction
+    is_regression: bool
+    is_improvement: bool
+    threshold_pct: float
+
+    @property
+    def direction_emoji(self) -> str:
+        if self.is_regression:   return "🔴"
+        if self.is_improvement:  return "🟢"
+        return "⚪"
+
+    @property
+    def delta_str(self) -> str:
+        sign = "+" if self.delta_pct >= 0 else ""
+        return f"{sign}{self.delta_pct:.1f}%"
+
+    @property
+    def status_label(self) -> str:
+        if self.is_regression:   return "REGRESSION"
+        if self.is_improvement:  return "IMPROVEMENT"
+        return "OK"
+
+    @property
+    def display_name(self) -> str:
+        return f"{self.metric_key} / {self.sub_key}"
+
+
+@dataclass
+class RegressionSummary:
+    timestamp:    str
+    commit_sha:   str
+    baseline_ver: str
+    threshold_pct: float
+    total_metrics: int
+    regressions:  int
+    improvements: int
+    ok:           int
+    passed:       bool
+    results:      list[dict] = field(default_factory=list)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Log parsers — extract "[BENCH] key=value" lines from benchmark logs
+# ─────────────────────────────────────────────────────────────────────────────
+# Expected log line formats (flexible):
+#   [BENCH] adamw_vec4  100M FP32  ms_per_step=1.05  bandwidth_GBps=1847.3
+#   [BENCH] zero2_sharded_ms=22.7
+#   [BENCH] ngpu_4  throughput_samples_per_sec=1176  scaling_efficiency=0.942
+#   [MEMORY_AUDIT] zero0_memory_per_rank_GB=19.46
+#   [THROUGHPUT]   samples_per_sec_adamw=9524
+
+_BENCH_LINE_RE = re.compile(
+    r"\[(?:BENCH|MEMORY_AUDIT|THROUGHPUT|SCALING)\]\s+"
+    r"(?P<label>[A-Za-z0-9_.]+)\s*"
+    r"(?:.*?)(?P<kvpairs>(?:[A-Za-z_]\w*=[\d.eE+\-]+\s*)+)"
+)
+
+_KV_RE = re.compile(r"([A-Za-z_]\w*)=([\d.eE+\-]+)")
+
+
+def parse_log_file(path: Path) -> dict[str, float]:
+    """
+    Parse a benchmark log file into a flat dict of metric_name → value.
+    metric_name is formed as  "<label>.<sub_key>"  (e.g. "adamw_vec4.ms_per_step").
+    """
+    metrics: dict[str, float] = {}
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as exc:
+        log.warning("Cannot read %s: %s", path, exc)
+        return metrics
+
+    for line in text.splitlines():
+        m = _BENCH_LINE_RE.search(line)
+        if not m:
+            # Fallback: bare "key=value" with no label
+            for k, v in _KV_RE.findall(line):
+                if k not in metrics:
+                    try:
+                        metrics[k] = float(v)
+                    except ValueError:
+                        pass
+            continue
+        label = m.group("label").lower()
+        for k, v in _KV_RE.findall(m.group("kvpairs")):
+            key = f"{label}.{k.lower()}"
+            try:
+                metrics[key] = float(v)
+            except ValueError:
+                pass
+
+    log.debug("Parsed %d metrics from %s", len(metrics), path.name)
+    return metrics
+
+
+def collect_all_metrics(results_dir: Path) -> dict[str, float]:
+    """Merge metrics from all *.log files in results_dir."""
+    all_metrics: dict[str, float] = {}
+    for log_file in sorted(results_dir.glob("**/*.log")):
+        parsed = parse_log_file(log_file)
+        all_metrics.update(parsed)
+    log.info("Collected %d total metrics from %s", len(all_metrics), results_dir)
+    return all_metrics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Baseline traversal — walk the JSON baseline and extract comparable metrics
+# ─────────────────────────────────────────────────────────────────────────────
+def _is_metric_dict(obj: Any) -> bool:
+    """Return True if obj looks like { value, higher_is_better, ... }."""
+    return (
+        isinstance(obj, dict)
+        and "value" in obj
+        and "higher_is_better" in obj
+    )
+
+
+def _is_metrics_section(obj: Any) -> bool:
+    """Return True if obj is a 'metrics' dict whose values are metric dicts."""
+    return isinstance(obj, dict) and all(_is_metric_dict(v) for v in obj.values())
+
+
+def extract_baseline_metrics(baseline: dict) -> list[tuple[str, str, str, float, bool]]:
+    """
+    Recursively walk baseline JSON and yield:
+      (section, metric_key, sub_key, baseline_value, higher_is_better)
+    for every leaf metric entry.
+    """
+    results: list[tuple[str, str, str, float, bool]] = []
+
+    def _walk(node: Any, section: str, metric_key: str) -> None:
+        if _is_metric_dict(node):
+            val = node.get("value")
+            hib = node.get("higher_is_better", True)
+            if val is not None:
+                # sub_key = "value" in this case (simple metric)
+                results.append((section, metric_key, "value", float(val), bool(hib)))
+            return
+
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k.startswith("_"):
+                    continue  # skip comment fields
+                if section == "" :
+                    _walk(v, k, "")
+                elif metric_key == "":
+                    # Inside a section (e.g. "single_gpu_fp32"), k is now metric_key
+                    if k == "metrics" and _is_metrics_section(v):
+                        for mk, mv in v.items():
+                            _walk(mv, section, mk)
+                    elif k == "metrics":
+                        for mk, mv in (v or {}).items():
+                            _walk(mv, section, mk)
+                    elif _is_metric_dict(v):
+                        _walk(v, section, k)
+                    else:
+                        _walk(v, section, k)
+                else:
+                    # Nested inside a metric — treat sub-keys as sub_key
+                    if isinstance(v, (int, float)) and not k.startswith("_") \
+                            and k not in ("higher_is_better",):
+                        hib_parent = node.get("higher_is_better", True)
+                        results.append((section, metric_key, k, float(v), bool(hib_parent)))
+
+    for top_key, top_val in baseline.items():
+        if top_key.startswith("_"):
+            continue
+        if top_key in ("device", "build", "regression_thresholds"):
+            continue
+        _walk(top_val, top_key, "")
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Matcher — resolve a baseline metric to its current measurement
+# ─────────────────────────────────────────────────────────────────────────────
+def _candidate_keys(section: str, metric_key: str, sub_key: str) -> list[str]:
+    """Generate candidate flat-key names to look up in current metrics."""
+    candidates = []
+    # Exact constructed key
+    if metric_key and sub_key and sub_key != "value":
+        candidates.append(f"{metric_key}.{sub_key}")
+    if metric_key:
+        candidates.append(f"{metric_key}.ms_per_step")
+        candidates.append(f"{metric_key}.throughput_samples_per_sec")
+        candidates.append(f"{metric_key}.effective_bandwidth_GBps")
+        candidates.append(f"{metric_key}.bandwidth_gbps")
+        candidates.append(f"{metric_key}.scaling_efficiency")
+        candidates.append(metric_key)
+    if sub_key and sub_key != "value":
+        candidates.append(sub_key)
+        candidates.append(f"{section}.{sub_key}")
+    # e.g. "zero2_sharded_ms"
+    if metric_key:
+        candidates.append(f"{section}.{metric_key}")
+    return candidates
+
+
+def match_current(
+    section: str, metric_key: str, sub_key: str,
+    current: dict[str, float]
+) -> float | None:
+    for ck in _candidate_keys(section, metric_key, sub_key):
+        # Case-insensitive lookup
+        for cur_k, cur_v in current.items():
+            if cur_k.lower() == ck.lower():
+                return cur_v
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Delta computation
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_delta(baseline_val: float, current_val: float, higher_is_better: bool) -> float:
+    """
+    Return signed percentage delta from the perspective of 'is this better?'.
+    Positive  → current is better than baseline.
+    Negative  → current is worse  than baseline.
+    """
+    if baseline_val == 0:
+        return 0.0
+    raw_pct = (current_val - baseline_val) / abs(baseline_val) * 100.0
+    # If lower is better (latency), flip sign so positive = improvement
+    return raw_pct if higher_is_better else -raw_pct
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Markdown table generation
+# ─────────────────────────────────────────────────────────────────────────────
+_MD_HEADER = """\
+### HPC Optimizer — Benchmark Regression Report
+
+| Status | Section | Metric | Sub-metric | Baseline | Current | Delta | Direction |
+|:------:|---------|--------|------------|:--------:|:-------:|:-----:|:---------:|
+"""
+
+_MD_FOOTER_TMPL = """
+---
+**Legend:** 🔴 Regression (>{threshold:.0f}%) · 🟢 Improvement (>{threshold:.0f}%) · ⚪ Stable  
+**Threshold:** {threshold:.1f}%  
+**Generated:** {ts}  
+**Commit:** `{sha}`
+"""
+
+
+def format_val(v: float, sub_key: str) -> str:
+    """Format a value with appropriate precision and unit."""
+    key = sub_key.lower()
+    if "pct" in key or "efficiency" in key:
+        return f"{v*100:.1f}%" if v <= 1.0 else f"{v:.1f}%"
+    if "ms" in key:
+        return f"{v:.2f} ms"
+    if "gbs" in key or "bandwidth" in key:
+        return f"{v:.0f} GB/s"
+    if "gb" in key and "gbs" not in key:
+        return f"{v:.2f} GB"
+    if "samples" in key or "throughput" in key:
+        return f"{v:,.0f} samp/s"
+    if v == int(v):
+        return str(int(v))
+    return f"{v:.3g}"
+
+
+def generate_markdown(
+    results: list[MetricResult],
+    threshold_pct: float,
+    commit_sha: str,
+) -> str:
+    lines = [_MD_HEADER]
+    for r in sorted(results, key=lambda x: (x.section, x.metric_key, x.sub_key)):
+        direction = "↓ lower=better" if not r.higher_is_better else "↑ higher=better"
+        lines.append(
+            f"| {r.direction_emoji} | `{r.section}` | `{r.metric_key}` "
+            f"| `{r.sub_key}` "
+            f"| {format_val(r.baseline_val, r.sub_key)} "
+            f"| {format_val(r.current_val,  r.sub_key)} "
+            f"| **{r.delta_str}** "
+            f"| {direction} |"
+        )
+
+    # Summary block
+    regressions  = sum(1 for r in results if r.is_regression)
+    improvements = sum(1 for r in results if r.is_improvement)
+
+    if regressions:
+        summary_icon = "🔴"
+        summary_txt  = f"**{regressions} regression(s) detected.**"
+    elif improvements:
+        summary_icon = "🟢"
+        summary_txt  = f"No regressions. {improvements} improvement(s) detected."
+    else:
+        summary_icon = "⚪"
+        summary_txt  = "All metrics stable. No regressions."
+
+    lines.append(f"\n{summary_icon} {summary_txt}")
+    lines.append(
+        _MD_FOOTER_TMPL.format(
+            threshold=threshold_pct,
+            ts=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            sha=commit_sha[:12] if commit_sha else "N/A",
+        )
+    )
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Baseline promotion — update baseline values with current results
+# ─────────────────────────────────────────────────────────────────────────────
+def promote_baseline(
+    baseline: dict,
+    results: list[MetricResult],
+    out_path: Path,
+) -> None:
+    """Write a new baseline JSON updating values from current benchmark run."""
+    import copy
+    new_baseline = copy.deepcopy(baseline)
+    new_baseline["_generated"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    new_baseline["_promoted_from"] = baseline.get("_generated", "unknown")
+
+    promoted = 0
+    for r in results:
+        # Walk new_baseline to find and update the matching leaf value
+        try:
+            section_node = new_baseline[r.section]
+            metrics_node = section_node.get("metrics", {})
+            if r.metric_key in metrics_node:
+                entry = metrics_node[r.metric_key]
+                if r.sub_key == "value":
+                    entry["value"] = r.current_val
+                else:
+                    entry[r.sub_key] = r.current_val
+                promoted += 1
+        except (KeyError, TypeError):
+            pass
+
+    out_path.write_text(json.dumps(new_baseline, indent=2))
+    log.info("Promoted baseline written to %s (%d values updated)", out_path, promoted)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="HPC Optimizer benchmark regression checker",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--baseline",          required=True,  type=Path, help="JSON baseline file")
+    p.add_argument("--results-dir",       required=True,  type=Path, help="Directory with *.log files")
+    p.add_argument("--output-markdown",   type=Path, default=None,   help="Write Markdown table here")
+    p.add_argument("--output-json",       type=Path, default=None,   help="Write JSON summary here")
+    p.add_argument("--promote-baseline",  type=Path, default=None,   help="Overwrite baseline with current")
+    p.add_argument("--threshold-pct",     type=float, default=5.0,   help="Regression threshold %%")
+    p.add_argument("--commit-sha",        type=str,   default="",    help="Git commit SHA for output")
+    p.add_argument("--verbose",           action="store_true",       help="Debug logging")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.verbose:
+        log.setLevel(logging.DEBUG)
+
+    # ── Load baseline ────────────────────────────────────────────────────────
+    if not args.baseline.is_file():
+        log.error("Baseline file not found: %s", args.baseline)
+        return 2
+    baseline = json.loads(args.baseline.read_text())
+    log.info("Loaded baseline v%s (generated %s)",
+             baseline.get("_version", "?"), baseline.get("_generated", "?"))
+
+    # Pull per-metric threshold overrides from baseline's regression_thresholds block
+    reg_thresholds = baseline.get("regression_thresholds", {})
+    default_threshold = reg_thresholds.get("ms_per_step_max_regression_pct", args.threshold_pct)
+
+    # ── Load current measurements ────────────────────────────────────────────
+    if not args.results_dir.is_dir():
+        log.error("Results directory not found: %s", args.results_dir)
+        return 2
+    current_metrics = collect_all_metrics(args.results_dir)
+
+    # ── Extract baseline entries ─────────────────────────────────────────────
+    baseline_entries = extract_baseline_metrics(baseline)
+    log.info("Found %d baseline metric entries", len(baseline_entries))
+
+    # ── Compare ──────────────────────────────────────────────────────────────
+    results: list[MetricResult] = []
+    matched   = 0
+    unmatched = 0
+
+    for section, metric_key, sub_key, bl_val, higher_is_better in baseline_entries:
+        cur_val = match_current(section, metric_key, sub_key, current_metrics)
+        if cur_val is None:
+            log.debug("No current data for %s / %s / %s — skipping", section, metric_key, sub_key)
+            unmatched += 1
+            continue
+        matched += 1
+
+        # Pick threshold: use sub_key-specific override if available
+        threshold = float(reg_thresholds.get(
+            f"{sub_key}_max_regression_pct",
+            reg_thresholds.get(f"{sub_key}_min_regression_pct", default_threshold)
+        ))
+
+        delta_pct      = compute_delta(bl_val, cur_val, higher_is_better)
+        is_regression  = delta_pct < -threshold
+        is_improvement = delta_pct >  threshold
+
+        results.append(MetricResult(
+            section=section,
+            metric_key=metric_key,
+            sub_key=sub_key,
+            baseline_val=bl_val,
+            current_val=cur_val,
+            higher_is_better=higher_is_better,
+            delta_pct=delta_pct,
+            is_regression=is_regression,
+            is_improvement=is_improvement,
+            threshold_pct=threshold,
+        ))
+
+    log.info("Compared %d metrics (%d unmatched, no current data)", matched, unmatched)
+
+    regressions  = [r for r in results if r.is_regression]
+    improvements = [r for r in results if r.is_improvement]
+
+    for r in regressions:
+        log.warning("REGRESSION  %s/%s/%s  baseline=%.3g  current=%.3g  delta=%s",
+                    r.section, r.metric_key, r.sub_key,
+                    r.baseline_val, r.current_val, r.delta_str)
+    for r in improvements:
+        log.info("IMPROVEMENT %s/%s/%s  baseline=%.3g  current=%.3g  delta=%s",
+                 r.section, r.metric_key, r.sub_key,
+                 r.baseline_val, r.current_val, r.delta_str)
+
+    # ── Build summary ────────────────────────────────────────────────────────
+    commit_sha = args.commit_sha or ""
+    summary = RegressionSummary(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        commit_sha=commit_sha,
+        baseline_ver=baseline.get("_version", "?"),
+        threshold_pct=default_threshold,
+        total_metrics=len(results),
+        regressions=len(regressions),
+        improvements=len(improvements),
+        ok=len(results) - len(regressions) - len(improvements),
+        passed=len(regressions) == 0,
+        results=[asdict(r) for r in results],
+    )
+
+    # ── Outputs ──────────────────────────────────────────────────────────────
+    if args.output_markdown:
+        md = generate_markdown(results, default_threshold, commit_sha)
+        args.output_markdown.parent.mkdir(parents=True, exist_ok=True)
+        args.output_markdown.write_text(md)
+        log.info("Markdown table written → %s", args.output_markdown)
+
+    if args.output_json:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(json.dumps(asdict(summary), indent=2))
+        log.info("JSON summary written  → %s", args.output_json)
+
+    if args.promote_baseline:
+        if results:
+            promote_baseline(baseline, results, args.promote_baseline)
+        else:
+            log.warning("No matched metrics — baseline not promoted.")
+
+    # ── Console summary ──────────────────────────────────────────────────────
+    print()
+    print("══════════════════════════════════════════════")
+    print(f"  HPC Optimizer Benchmark Regression Report")
+    print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print("══════════════════════════════════════════════")
+    print(f"  Metrics compared : {len(results)}")
+    print(f"  Regressions      : {len(regressions)}")
+    print(f"  Improvements     : {len(improvements)}")
+    print(f"  Stable           : {summary.ok}")
+    print(f"  Threshold        : {default_threshold:.1f}%")
+    print("──────────────────────────────────────────────")
+    if regressions:
+        print("  ❌  FAILED — regressions detected:")
+        for r in regressions:
+            print(f"      • {r.section}/{r.metric_key}/{r.sub_key}  "
+                  f"({r.delta_str}  baseline={r.baseline_val:.3g}  current={r.current_val:.3g})")
+    else:
+        print("  ✅  PASSED — no regressions.")
+    print("══════════════════════════════════════════════")
+    print()
+
+    return 0 if summary.passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
