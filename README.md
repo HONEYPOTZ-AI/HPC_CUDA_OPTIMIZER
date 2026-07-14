@@ -284,6 +284,14 @@ You can also specify a custom output path:
 python3 hpc_optimizer_installer.py /path/to/my/project/hpc_optimizer
 
 
+A natural next step would be to wire a branch protection rule in GitHub: go to Settings → Branches → main → Require status checks → add CI Gate — that makes the gate legally required even if someone force-pushes, and the regression-check job is already folded into it.
+
+
+
+
+
+
+
 
 All 31 files will be reconstructed exactly — headers, examples, tests, scripts, CI/CD workflows, CMakeLists.txt, and README.md. From there, a single CMake configure gets you building on any V100/A100/H100 node:
 
