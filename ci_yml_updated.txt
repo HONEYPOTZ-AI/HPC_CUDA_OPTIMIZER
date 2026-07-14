@@ -1,0 +1,637 @@
+name: HPC Optimizer CI
+
+on:
+  push:
+    branches: [main, develop, "release/**"]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      gpu_arch:
+        description: "GPU architecture target (sm70|sm80|sm90|all)"
+        required: false
+        default: "all"
+      run_benchmarks:
+        description: "Run throughput benchmarks"
+        required: false
+        default: "false"
+        type: boolean
+
+# ── Cancel superseded runs on the same branch ─────────────────────────────────
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Global env ────────────────────────────────────────────────────────────────
+env:
+  BUILD_TYPE: Release
+  CMAKE_GENERATOR: Ninja
+  NCCL_TIMEOUT: 300
+  # Propagated into SLURM jobs by slurm_job_wrapper.sh
+  HPC_LIB_ROOT: ${{ github.workspace }}
+
+# =============================================================================
+# JOB 1 — Lint & static analysis (runs on login node, no GPU needed)
+# =============================================================================
+jobs:
+  lint:
+    name: "Lint / Static Analysis"
+    runs-on: [self-hosted, hpc, slurm]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Source runner environment
+        run: source ${{ runner.tool_cache }}/../runner_env.sh 2>/dev/null || true
+
+      - name: Check CUDA toolkit present
+        run: |
+          nvcc --version || { echo "nvcc not found — check runner_env.sh"; exit 1; }
+          cmake --version
+
+      - name: Validate CMakeLists
+        run: |
+          cmake -S . -B build_lint \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHPC_ENABLE_NCCL=OFF \
+            -DHPC_ENABLE_MPI=OFF \
+            -DHPC_ENABLE_NVTX=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="80" \
+            --no-warn-unused-cli \
+            -Wdev 2>&1 | tee build_lint/cmake_lint.log
+          grep -i "error" build_lint/cmake_lint.log && exit 1 || true
+
+      - name: Header include guard check
+        run: |
+          echo "Checking for duplicate include guards..."
+          python3 - <<'PYEOF'
+          import glob, re, sys
+          seen = {}
+          errors = []
+          for f in glob.glob("include/*.cuh") + glob.glob("include/*.h"):
+              text = open(f).read()
+              guards = re.findall(r'#ifndef\s+(\w+_H\w*)', text)
+              for g in guards:
+                  if g in seen:
+                      errors.append(f"Duplicate guard {g}: {f} vs {seen[g]}")
+                  seen[g] = f
+          if errors:
+              print("ERRORS:", "\n".join(errors)); sys.exit(1)
+          print(f"OK — checked {len(seen)} include guards.")
+          PYEOF
+
+      - name: Shell script lint (shellcheck)
+        run: |
+          if command -v shellcheck &>/dev/null; then
+            shellcheck --severity=warning scripts/*.sh
+          else
+            echo "shellcheck not installed — skipping."
+          fi
+
+# =============================================================================
+# JOB 2 — Build matrix (dispatched to GPU compute nodes via SLURM)
+# =============================================================================
+  build:
+    name: "Build (${{ matrix.build_type }}, ${{ matrix.arch }})"
+    needs: lint
+    runs-on: [self-hosted, hpc, slurm, gpu]
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
+        arch: [sm_70, sm_80, sm_90]
+        exclude:
+          # Skip Debug+sm_70 to reduce matrix size
+          - build_type: Debug
+            arch: sm_70
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Source runner environment
+        run: source scripts/runner_env.sh
+
+      - name: Dispatch to SLURM compute node — CMake Configure
+        run: |
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 1 --nodes 1 --time 00:20:00 \
+            --job-name "hpc-configure-${{ matrix.arch }}-${{ matrix.build_type }}" \
+            -- \
+            cmake -S . -B build_${{ matrix.arch }}_${{ matrix.build_type }} \
+              -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+              -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.arch == 'sm_70' && '70' || matrix.arch == 'sm_80' && '80' || '90' }}" \
+              -DHPC_ENABLE_NCCL=ON \
+              -DHPC_ENABLE_MPI=ON \
+              -DHPC_ENABLE_NVTX=ON \
+              -DHPC_ENABLE_CUBLAS=ON
+
+      - name: Dispatch to SLURM compute node — Build
+        run: |
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 1 --nodes 1 --time 00:30:00 \
+            --job-name "hpc-build-${{ matrix.arch }}-${{ matrix.build_type }}" \
+            -- \
+            cmake --build build_${{ matrix.arch }}_${{ matrix.build_type }} \
+              --parallel $(nproc) \
+              2>&1 | tee build_${{ matrix.arch }}_${{ matrix.build_type }}/build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.arch }}-${{ matrix.build_type }}
+          path: build_${{ matrix.arch }}_${{ matrix.build_type }}/build.log
+          retention-days: 7
+
+# =============================================================================
+# JOB 3 — Unit tests (4 suites, parallelised, each on its own GPU node)
+# =============================================================================
+  test:
+    name: "Tests — ${{ matrix.suite }}"
+    needs: build
+    runs-on: [self-hosted, hpc, slurm, gpu]
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - test_hpc_optimizers   # 12 tests: Adam/Lion/SGD/clip/convergence/benchmark
+          - test_precision        # 12 tests: FP32/FP16/BF16 round-trips, vec4/vec2
+          - test_zero2            # 12 tests: ShardLayout, AdamW/Lion/SGD shards, throughput
+          - test_zero3            # 12 tests: ZeRO-3 scatter/prefetch/release/convergence
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Source runner environment
+        run: source scripts/runner_env.sh
+
+      - name: Build test suite (sm_80 Release — A100 target)
+        run: |
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 1 --nodes 1 --time 00:25:00 \
+            --job-name "hpc-build-${{ matrix.suite }}" \
+            -- \
+            bash -c "
+              cmake -S . -B build_test_${{ matrix.suite }} \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CUDA_ARCHITECTURES=80 \
+                -DHPC_ENABLE_NCCL=ON -DHPC_ENABLE_MPI=ON \
+                -DHPC_ENABLE_NVTX=ON -DHPC_ENABLE_CUBLAS=ON && \
+              cmake --build build_test_${{ matrix.suite }} \
+                --target ${{ matrix.suite }} --parallel $(nproc)
+            "
+
+      - name: Run test suite on GPU node
+        run: |
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 1 --nodes 1 --time 00:30:00 \
+            --job-name "hpc-test-${{ matrix.suite }}" \
+            --out results_${{ matrix.suite }}.xml \
+            -- \
+            bash -c "
+              cd build_test_${{ matrix.suite }} && \
+              ctest --test-dir . \
+                    --tests-regex ${{ matrix.suite }} \
+                    --output-on-failure \
+                    --output-junit ../${{ matrix.suite }}_results.xml \
+                    -j1 \
+                    --timeout 300
+            "
+
+      - name: Upload JUnit XML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.suite }}
+          path: ${{ matrix.suite }}_results.xml
+          retention-days: 30
+
+      - name: Publish test results
+        if: always()
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: "${{ matrix.suite }}_results.xml"
+          check_name: "Tests: ${{ matrix.suite }}"
+          fail_on_failure: true
+
+# =============================================================================
+# JOB 4 — Multi-GPU NCCL communication tests (2 GPUs, single node)
+# =============================================================================
+  test-multigpu:
+    name: "Multi-GPU NCCL Tests (2 GPUs)"
+    needs: build
+    runs-on: [self-hosted, hpc, slurm, gpu2x]   # needs ≥2 GPUs on one node
+    timeout-minutes: 45
+    # Only run on main branch or explicit workflow_dispatch to save GPU hours
+    if: |
+      github.ref == 'refs/heads/main' ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Source runner environment
+        run: source scripts/runner_env.sh
+
+      - name: Build multi-GPU tests
+        run: |
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 2 --nodes 1 --ntasks 2 --time 00:25:00 \
+            --job-name "hpc-build-multigpu" \
+            -- \
+            bash -c "
+              cmake -S . -B build_multigpu \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CUDA_ARCHITECTURES=80 \
+                -DHPC_ENABLE_NCCL=ON -DHPC_ENABLE_MPI=ON && \
+              cmake --build build_multigpu \
+                --target test_hpc_optimizers --parallel $(nproc)
+            "
+
+      - name: Run 2-GPU MPI tests via SLURM
+        run: |
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 2 --nodes 1 --ntasks 2 \
+            --time 00:30:00 \
+            --mode sbatch \
+            --job-name "hpc-nccl-2gpu" \
+            -- \
+            bash -c "
+              mpirun -n 2 --map-by slot:PE=4 \
+                ./build_multigpu/tests/test_hpc_optimizers \
+                --nccl-test --output-junit nccl_2gpu_results.xml
+            "
+
+      - name: Upload NCCL test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-nccl-2gpu
+          path: nccl_2gpu_results.xml
+          retention-days: 30
+
+# =============================================================================
+# JOB 5 — Throughput benchmarks (optional, manual trigger or nightly)
+# =============================================================================
+  benchmark:
+    name: "Throughput Benchmarks"
+    needs: [test]
+    runs-on: [self-hosted, hpc, slurm, gpu, ampere]   # A100 specifically
+    timeout-minutes: 90
+    if: |
+      github.event_name == 'workflow_dispatch' && github.event.inputs.run_benchmarks == 'true' ||
+      github.event_name == 'schedule'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Source runner environment
+        run: source scripts/runner_env.sh
+
+      - name: Build benchmarks (Release, sm_80)
+        run: |
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 1 --nodes 1 --time 00:20:00 \
+            --job-name "hpc-build-bench" \
+            -- \
+            bash -c "
+              cmake -S . -B build_bench \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CUDA_ARCHITECTURES=80 \
+                -DHPC_ENABLE_NCCL=ON -DHPC_ENABLE_MPI=ON \
+                -DHPC_ENABLE_NVTX=ON -DHPC_ENABLE_CUBLAS=ON && \
+              cmake --build build_bench --parallel $(nproc)
+            "
+
+      - name: Run 1-GPU throughput benchmark
+        run: |
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 1 --nodes 1 --time 00:30:00 \
+            --mode sbatch \
+            --job-name "hpc-bench-1gpu" \
+            --out bench_1gpu.log \
+            -- \
+            bash -c "
+              ./build_bench/examples/train_single 2>&1 | tee bench_1gpu.log
+            "
+
+      - name: Run 8-GPU ZeRO-2 scaling benchmark
+        run: |
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 8 --nodes 1 --ntasks 8 --time 00:45:00 \
+            --mode sbatch \
+            --job-name "hpc-bench-8gpu" \
+            --out bench_8gpu.log \
+            -- \
+            bash -c "
+              mpirun -n 8 ./build_bench/examples/train_zero2 2>&1 | tee bench_8gpu.log
+            "
+
+      - name: Parse results and check regression
+        run: |
+          python3 scripts/check_regression.py \
+            --logs bench_1gpu.log bench_8gpu.log \
+            --baseline .github/benchmark_baseline.json \
+            --threshold 0.10
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: |
+            bench_1gpu.log
+            bench_8gpu.log
+          retention-days: 90
+
+      - name: Post benchmark summary to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '## 📊 Benchmark Results\n\n';
+            for (const logFile of ['bench_1gpu.log', 'bench_8gpu.log']) {
+              try {
+                const lines = fs.readFileSync(logFile, 'utf8').split('\n');
+                const throughput = lines.filter(l => l.includes('throughput') || l.includes('GB/s') || l.includes('ms/step'));
+                body += `**${logFile}**\n\`\`\`\n${throughput.slice(0,10).join('\n')}\n\`\`\`\n\n`;
+              } catch(e) { body += `_${logFile}: not found_\n\n`; }
+            }
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+# =============================================================================
+# JOB 6 — Compute-sanitizer memory audit (weekly / on-demand)
+# =============================================================================
+  sanitizer:
+    name: "Compute-Sanitizer Memory Audit"
+    needs: [test]
+    runs-on: [self-hosted, hpc, slurm, gpu]
+    timeout-minutes: 90
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Source runner environment
+        run: source scripts/runner_env.sh
+
+      - name: Build with sanitizer flags
+        run: |
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 1 --nodes 1 --time 00:20:00 \
+            --job-name "hpc-build-sanitizer" \
+            -- \
+            cmake -S . -B build_sanitizer \
+              -DCMAKE_BUILD_TYPE=Debug \
+              -DCMAKE_CUDA_ARCHITECTURES=80 \
+              -DHPC_ENABLE_NCCL=OFF -DHPC_ENABLE_MPI=OFF \
+              -DCMAKE_CUDA_FLAGS="-lineinfo -G" && \
+            cmake --build build_sanitizer \
+              --target test_hpc_optimizers test_precision --parallel $(nproc)
+
+      - name: Run compute-sanitizer (memcheck)
+        run: |
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 1 --nodes 1 --time 01:00:00 \
+            --mode sbatch \
+            --job-name "hpc-sanitizer" \
+            --out sanitizer.log \
+            -- \
+            bash -c "
+              compute-sanitizer --tool memcheck --leak-check=full \
+                ./build_sanitizer/tests/test_hpc_optimizers \
+                --gtest_filter='*Adam*:*SGD*:*Lion*' \
+                2>&1 | tee sanitizer.log
+              grep -E 'ERROR|LEAK' sanitizer.log && exit 1 || true
+            "
+
+      - name: Upload sanitizer report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-report-${{ github.sha }}
+          path: sanitizer.log
+          retention-days: 30
+
+# =============================================================================
+# JOB 7 — PR Regression Check (runs on every PR after tests; sticky comment)
+# =============================================================================
+  regression-check:
+    name: "Regression Check (vs Baseline)"
+    needs: [test]
+    runs-on: [self-hosted, hpc, slurm, gpu, ampere]   # A100 needed for throughput numbers
+    timeout-minutes: 45
+    # Run on every PR and every push to main; skip forks without secrets
+    if: |
+      github.event_name == 'pull_request' ||
+      github.ref == 'refs/heads/main'
+
+    env:
+      BASELINE:    .github/benchmark_baseline.json
+      RESULTS_DIR: regression_results
+      REGRESSION_MD: regression_results/regression_table.md
+      REGRESSION_JSON: regression_results/regression_summary.json
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Source runner environment
+        run: source scripts/runner_env.sh
+
+      # ── Build test_hpc_optimizers (contains throughput benchmark, test #12) ──
+      - name: Build optimizer test suite (sm_80 Release)
+        run: |
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 1 --nodes 1 --time 00:20:00 \
+            --job-name "hpc-build-regr-${{ github.run_id }}" \
+            -- \
+            bash -c "
+              cmake -S . -B build_regr \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CUDA_ARCHITECTURES=80 \
+                -DHPC_ENABLE_NCCL=ON -DHPC_ENABLE_MPI=ON \
+                -DHPC_ENABLE_NVTX=ON -DHPC_ENABLE_CUBLAS=ON && \
+              cmake --build build_regr \
+                --target test_hpc_optimizers --parallel \$(nproc)
+            "
+
+      # ── Run only the throughput benchmark test (test #12 in the suite) ──────
+      - name: Run throughput benchmark on GPU node
+        run: |
+          mkdir -p ${{ env.RESULTS_DIR }}
+          bash scripts/slurm_job_wrapper.sh \
+            --gpus 1 --nodes 1 --time 00:20:00 \
+            --mode sbatch \
+            --job-name "hpc-regr-bench-${{ github.run_id }}" \
+            --out ${{ env.RESULTS_DIR }}/throughput_bench.log \
+            -- \
+            bash -c "
+              cd build_regr && \
+              ctest --tests-regex 'ThroughputBenchmark|throughput|bench' \
+                    --output-on-failure -j1 --timeout 300 \
+                    2>&1 | tee ../${{ env.RESULTS_DIR }}/throughput_bench.log
+            "
+
+      # ── Parse results and generate regression table ────────────────────────
+      - name: Run regression checker
+        id: regression
+        run: |
+          python3 scripts/check_regression.py \
+            --baseline        ${{ env.BASELINE }} \
+            --results-dir     ${{ env.RESULTS_DIR }} \
+            --output-markdown ${{ env.REGRESSION_MD }} \
+            --output-json     ${{ env.REGRESSION_JSON }} \
+            --threshold-pct   5.0 \
+          && echo "status=pass" >> "$GITHUB_OUTPUT" \
+          || echo "status=fail" >> "$GITHUB_OUTPUT"
+
+      # ── Post / update sticky PR comment ───────────────────────────────────
+      - name: Post regression table as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs   = require('fs');
+            const path = require('path');
+
+            const mdFile = '${{ env.REGRESSION_MD }}';
+            let table = '';
+            try {
+              table = fs.readFileSync(mdFile, 'utf8');
+            } catch(e) {
+              table = '_Regression table not generated — see workflow logs._';
+            }
+
+            const status  = '${{ steps.regression.outputs.status }}';
+            const icon    = status === 'pass' ? '✅' : '🚨';
+            const heading = status === 'pass'
+              ? '✅ No performance regressions detected'
+              : '🚨 Performance regressions detected — merge blocked';
+
+            const body = [
+              '<!-- hpc-optimizer-regression-bot -->',
+              `## ${heading}`,
+              '',
+              `> Compared against \`.github/benchmark_baseline.json\` · threshold **5 %** · commit \`${{ github.sha }}\``,
+              '',
+              table,
+              '',
+              '<details><summary>Legend</summary>',
+              '',
+              '| Symbol | Meaning |',
+              '|--------|---------|',
+              '| 🔴 | Regression exceeds threshold — **must fix before merge** |',
+              '| 🟢 | Improvement vs baseline |',
+              '| ⚪ | Within tolerance (±5 %) |',
+              '',
+              '</details>',
+            ].join('\n');
+
+            // Sticky comment: update existing bot comment instead of creating new ones
+            const BOT_MARKER = '<!-- hpc-optimizer-regression-bot -->';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(BOT_MARKER));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+              core.info(`Updated existing regression comment (id ${existing.id})`);
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+              core.info('Created new regression comment');
+            }
+
+      # ── Fail the job if regressions were found (blocks ci-gate) ───────────
+      - name: Fail if regressions exceed threshold
+        if: steps.regression.outputs.status == 'fail'
+        run: |
+          echo "::error::One or more benchmarks regressed by more than 5% vs baseline."
+          echo "::error::Review the regression table in the PR comment and fix before merging."
+          exit 1
+
+      - name: Upload regression artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-${{ github.sha }}
+          path: |
+            ${{ env.RESULTS_DIR }}/throughput_bench.log
+            ${{ env.RESULTS_DIR }}/regression_table.md
+            ${{ env.RESULTS_DIR }}/regression_summary.json
+          retention-days: 30
+
+# =============================================================================
+# JOB 8 — CI gate (required status check — blocks merge if any job failed)
+# =============================================================================
+  ci-gate:
+    name: "CI Gate"
+    needs: [lint, build, test, test-multigpu, regression-check]
+    runs-on: [self-hosted, hpc, slurm]
+    if: always()
+    timeout-minutes: 5
+
+    steps:
+      - name: Check all required jobs passed
+        run: |
+          echo "lint:              ${{ needs.lint.result }}"
+          echo "build:             ${{ needs.build.result }}"
+          echo "test:              ${{ needs.test.result }}"
+          echo "test-multigpu:     ${{ needs.test-multigpu.result }}"
+          echo "regression-check:  ${{ needs.regression-check.result }}"
+
+          for result in \
+            "${{ needs.lint.result }}" \
+            "${{ needs.build.result }}" \
+            "${{ needs.test.result }}" \
+            "${{ needs.regression-check.result }}"; do
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              echo "::error::Required job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All required jobs passed ✅"
+
+# =============================================================================
+# Scheduled triggers
+# =============================================================================
+# Note: add this to the top-level `on:` block in your repo:
+#
+#   schedule:
+#     - cron: '0 2 * * 1'   # Monday 02:00 UTC — weekly sanitizer
+#     - cron: '0 3 * * *'   # Daily  03:00 UTC — nightly benchmark (benchmark.yml)
