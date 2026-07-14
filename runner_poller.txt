@@ -26,9 +26,11 @@ set -euo pipefail
 
 # ── Load config ───────────────────────────────────────────────────────────────
 CONFIG_FILE="${RUNNER_INSTALL_DIR:-/opt/gh-runner}/.runner_config"
+# shellcheck source=/opt/gh-runner/.runner_config
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 RUNNER_INSTALL_DIR="${RUNNER_INSTALL_DIR:-/opt/gh-runner}"
+# shellcheck source=/opt/gh-runner/runner_env.sh
 source "${RUNNER_INSTALL_DIR}/runner_env.sh" 2>/dev/null || true
 
 # ── Required: GitHub PAT ──────────────────────────────────────────────────────
@@ -36,7 +38,8 @@ GH_PAT="${GH_PAT:-}"
 if [[ -z "$GH_PAT" ]]; then
   # Try reading from a secrets file (chmod 600, owned by runner user)
   SECRETS_FILE="${RUNNER_INSTALL_DIR}/.gh_secrets"
-  [[ -f "$SECRETS_FILE" ]] && source "$SECRETS_FILE"
+  # shellcheck source=/opt/gh-runner/.gh_secrets
+[[ -f "$SECRETS_FILE" ]] && source "$SECRETS_FILE"
 fi
 if [[ -z "${GH_PAT:-}" ]]; then
   echo "[poller][WARN] GH_PAT not set — cannot poll GitHub API. Set GH_PAT in environment or ${RUNNER_INSTALL_DIR}/.gh_secrets"
@@ -52,10 +55,16 @@ EPHEMERAL_MEM="${EPHEMERAL_MEM:-128000}"
 POLL_LABELS_FILTER="${POLL_LABELS_FILTER:-self-hosted,hpc}"
 SLURM_PARTITION="${SLURM_PARTITION:-gpu}"
 GH_REPO_URL="${GH_REPO_URL:-}"
+# ── Validate repo URL ───────────────────────────────────────────────────────
+if [[ -z "${GH_REPO_URL:-}" ]]; then
+  warn "GH_REPO_URL not set — cannot determine repo. Set GH_REPO_URL in ${RUNNER_INSTALL_DIR}/.runner_config or environment."
+  exit 0
+fi
+
 LOCK_FILE="/tmp/gh_runner_poller.lock"
 
 # ── Parse repo owner/name from URL ───────────────────────────────────────────
-GH_ORG_REPO=$(echo "${GH_REPO_URL}" | sed 's|https://github.com/||')
+GH_ORG_REPO=${GH_REPO_URL#https://github.com/}
 GH_API_BASE="https://api.github.com/repos/${GH_ORG_REPO}"
 
 ts()   { date '+%Y-%m-%d %H:%M:%S'; }

@@ -42,6 +42,7 @@ done
 
 # ── Load config ───────────────────────────────────────────────────────────────
 CONFIG_FILE="${RUNNER_INSTALL_DIR}/.runner_config"
+# shellcheck source=/opt/gh-runner/.runner_config
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 RUNNER_WORKDIR="${RUNNER_WORKDIR:-/scratch/gh-runner/work}"
 
@@ -97,7 +98,7 @@ fi
 # ── Fetch removal token from API if PAT available ────────────────────────────
 if [[ -z "$REMOVAL_TOKEN" ]] && [[ -n "${GH_PAT:-}" ]] && [[ -n "${GH_REPO_URL:-}" ]]; then
   info "Fetching removal token from GitHub API..."
-  GH_ORG_REPO=$(echo "${GH_REPO_URL}" | sed 's|https://github.com/||')
+  GH_ORG_REPO=${GH_REPO_URL#https://github.com/}
   REMOVAL_TOKEN=$(curl -sSf -X POST \
     -H "Authorization: Bearer ${GH_PAT}" \
     -H "Accept: application/vnd.github+json" \
@@ -116,9 +117,11 @@ if [[ -f "${RUNNER_INSTALL_DIR}/config.sh" ]]; then
   info "De-registering runner from GitHub..."
   cd "${RUNNER_INSTALL_DIR}"
   if [[ -n "$REMOVAL_TOKEN" ]]; then
-    ./config.sh remove --unattended --token "$REMOVAL_TOKEN" 2>/dev/null \
-      && success "Runner de-registered." \
-      || warn "De-registration failed (token may have expired). Remove manually in GitHub repo Settings → Actions → Runners."
+    if ./config.sh remove --unattended --token "$REMOVAL_TOKEN" 2>/dev/null; then
+      success "Runner de-registered."
+    else
+      warn "De-registration failed (token may have expired). Remove manually in GitHub repo Settings → Actions → Runners."
+    fi
   else
     warn "No removal token — runner will appear offline in GitHub."
     warn "Remove it manually: Repo Settings → Actions → Runners → Remove."
