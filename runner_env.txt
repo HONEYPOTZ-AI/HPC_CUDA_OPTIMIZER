@@ -4,6 +4,7 @@
 #                   on the HPC self-hosted runner.
 #
 # Source this file, do NOT execute it directly:
+# shellcheck source=/opt/gh-runner/runner_env.sh
 #   source /opt/gh-runner/runner_env.sh
 #
 # This file is automatically sourced by:
