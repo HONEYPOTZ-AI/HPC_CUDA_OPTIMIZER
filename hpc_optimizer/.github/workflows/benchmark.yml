@@ -1,0 +1,235 @@
+name: HPC Optimizer Benchmark (Performance Regression)
+
+on:
+  schedule:
+    # Run nightly at 02:00 UTC on weekdays
+    - cron: '0 2 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      param_scale:
+        description: 'Parameter scale for benchmark (millions)'
+        required: false
+        default: '100'
+        type: string
+      world_size:
+        description: 'Number of GPUs for distributed benchmarks'
+        required: false
+        default: '1'
+        type: string
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BENCHMARK_THRESHOLD_PCT: "10"   # Fail if regression > 10% vs baseline
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # Job 1: Optimizer throughput benchmarks (single GPU)
+  # ─────────────────────────────────────────────────────────
+  benchmark-single-gpu:
+    name: Optimizer Throughput Benchmark
+    runs-on: [self-hosted, slurm, gpu]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Need history for baseline comparison
+
+      - name: Build Release (sm_80)
+        run: |
+          cmake -B build_bench \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCUDA_ARCHS="80" \
+            -DHPC_ENABLE_NCCL=ON \
+            -DHPC_ENABLE_NVTX=ON \
+            -DCMAKE_CUDA_FLAGS="-O3 --use_fast_math"
+          cmake --build build_bench --parallel $(nproc)
+
+      - name: Warm up GPU
+        run: |
+          # Run a short warm-up to ensure GPU is at boost clock
+          build_bench/examples/train_single --steps 20 --params 10000000 \
+            2>/dev/null || true
+
+      - name: Run optimizer throughput benchmark
+        run: |
+          PARAM_M=${{ github.event.inputs.param_scale || '100' }}
+          N=$((PARAM_M * 1000000))
+
+          echo "=== HPC Optimizer Benchmark ===" | tee benchmark_results.txt
+          echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> benchmark_results.txt
+          echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)" >> benchmark_results.txt
+          echo "Params: ${PARAM_M}M (${N} elements)" >> benchmark_results.txt
+          echo "" >> benchmark_results.txt
+
+          # Run training suite benchmark (outputs timing per optimizer)
+          build_bench/examples/train_single \
+            --steps 200 \
+            --params ${N} \
+            --benchmark-mode \
+            2>&1 | tee -a benchmark_results.txt
+
+      - name: Run ZeRO-2 vs ZeRO-0 benchmark
+        run: |
+          echo "" >> benchmark_results.txt
+          echo "=== ZeRO-2 vs ZeRO-0 Benchmark ===" >> benchmark_results.txt
+          build_bench/examples/train_zero2 \
+            --steps 100 \
+            --params 64000000 \
+            --benchmark-mode \
+            2>&1 | tee -a benchmark_results.txt
+
+      - name: Check GPU utilization
+        run: |
+          echo "" >> benchmark_results.txt
+          echo "=== GPU Stats ===" >> benchmark_results.txt
+          nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used,memory.free,clocks.gr \
+            --format=csv,noheader,nounits >> benchmark_results.txt
+
+      - name: Store baseline (main branch only)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cp benchmark_results.txt benchmark_baseline.txt
+          echo "COMMIT=$(git rev-parse HEAD)" >> benchmark_baseline.txt
+
+      - name: Compare against baseline
+        if: github.ref != 'refs/heads/main'
+        run: |
+          if [ -f benchmark_baseline.txt ]; then
+            echo "Comparing against stored baseline..."
+            python3 scripts/check_regression.py \
+              --current benchmark_results.txt \
+              --baseline benchmark_baseline.txt \
+              --threshold ${BENCHMARK_THRESHOLD_PCT}
+          else
+            echo "No baseline found — skipping regression check"
+          fi
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: |
+            benchmark_results.txt
+            benchmark_baseline.txt
+          retention-days: 90
+
+      - name: Post benchmark summary to PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: benchmark
+          message: |
+            ## 🚀 Benchmark Results
+
+            <details>
+            <summary>Click to expand throughput numbers</summary>
+
+            ```
+            $(cat benchmark_results.txt)
+            ```
+            </details>
+
+  # ─────────────────────────────────────────────────────────
+  # Job 2: Multi-GPU scaling benchmark (2/4/8 GPUs)
+  # ─────────────────────────────────────────────────────────
+  benchmark-scaling:
+    name: Distributed Scaling Benchmark (${{ matrix.world_size }}× GPU)
+    runs-on: [self-hosted, slurm, gpu, multi-gpu]
+    timeout-minutes: 90
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        world_size: [2, 4, 8]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Release
+        run: |
+          cmake -B build_bench \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCUDA_ARCHS="80" \
+            -DHPC_ENABLE_NCCL=ON \
+            -DHPC_ENABLE_MPI=ON \
+            -DHPC_ENABLE_NVTX=ON
+          cmake --build build_bench --parallel $(nproc)
+
+      - name: Check GPU availability
+        id: gpu_check
+        run: |
+          GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+          echo "gpu_count=${GPU_COUNT}" >> $GITHUB_OUTPUT
+          echo "Available GPUs: ${GPU_COUNT}"
+
+      - name: Run ZeRO-2 scaling (${{ matrix.world_size }}× GPU)
+        if: steps.gpu_check.outputs.gpu_count >= matrix.world_size
+        run: |
+          WS=${{ matrix.world_size }}
+          echo "=== ZeRO-2 Scaling: ${WS}× GPU ===" | tee scaling_${WS}gpu.txt
+          mpirun --allow-run-as-root -np ${WS} \
+            --bind-to none \
+            -x NCCL_DEBUG=WARN \
+            -x NCCL_IB_DISABLE=0 \
+            build_bench/examples/train_zero2 \
+              --steps 50 \
+              --params 500000000 \
+              --benchmark-mode \
+            2>&1 | tee -a scaling_${WS}gpu.txt
+
+      - name: Upload scaling results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scaling-benchmark-${{ matrix.world_size }}gpu-${{ github.sha }}
+          path: scaling_*.txt
+          retention-days: 90
+
+  # ─────────────────────────────────────────────────────────
+  # Job 3: Memory footprint audit
+  # ─────────────────────────────────────────────────────────
+  benchmark-memory:
+    name: Memory Footprint Audit
+    runs-on: [self-hosted, slurm, gpu]
+    timeout-minutes: 30
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Release
+        run: |
+          cmake -B build_bench \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCUDA_ARCHS="80" \
+            -DHPC_ENABLE_NCCL=ON
+          cmake --build build_bench --parallel $(nproc)
+
+      - name: Run memory audit (cuda-memcheck / compute-sanitizer)
+        run: |
+          echo "=== Memory Audit ===" | tee memory_audit.txt
+          compute-sanitizer --tool memcheck \
+            build_bench/tests/test_hpc_optimizers \
+            2>&1 | grep -E "(ERROR|LEAK|bytes|OK)" | tee -a memory_audit.txt || true
+
+          echo "" >> memory_audit.txt
+          echo "=== ZeRO Memory Footprint ===" >> memory_audit.txt
+          compute-sanitizer --tool memcheck \
+            build_bench/tests/test_zero2 \
+            2>&1 | grep -E "(ERROR|LEAK|bytes|OK)" | tee -a memory_audit.txt || true
+
+      - name: Upload memory audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-audit-${{ github.sha }}
+          path: memory_audit.txt
+          retention-days: 30

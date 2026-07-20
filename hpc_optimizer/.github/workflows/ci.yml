@@ -1,0 +1,265 @@
+name: HPC Optimizer CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      run_multigpu:
+        description: 'Run multi-GPU tests (requires 2+ GPUs on runner)'
+        required: false
+        default: 'false'
+        type: boolean
+
+# Cancel in-progress runs for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CUDA_VERSION: "12.2"
+  NCCL_VERSION: "2.18"
+  CMAKE_VERSION: "3.27"
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Build matrix (Debug + Release, sm_80)
+  # Runs on self-hosted SLURM runner with GPU node
+  # ─────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.build_type }}, sm_${{ matrix.sm }})
+    runs-on: [self-hosted, slurm, gpu]
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
+        sm: ["80"]          # Primary: A100
+        include:
+          - build_type: Release
+            sm: "70"        # V100 compat check (compile only, no runtime test)
+          - build_type: Release
+            sm: "90"        # H100 compat check (compile only, no runtime test)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Verify CUDA environment
+        run: |
+          nvcc --version
+          nvidia-smi
+          echo "CUDA_HOME=${CUDA_HOME}"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+
+      - name: Cache CMake build directory
+        uses: actions/cache@v4
+        with:
+          path: build_${{ matrix.build_type }}_sm${{ matrix.sm }}
+          key: cmake-${{ matrix.build_type }}-sm${{ matrix.sm }}-${{ hashFiles('CMakeLists.txt', 'include/**') }}
+          restore-keys: |
+            cmake-${{ matrix.build_type }}-sm${{ matrix.sm }}-
+
+      - name: Configure CMake
+        run: |
+          cmake -B build_${{ matrix.build_type }}_sm${{ matrix.sm }} \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCUDA_ARCHS="${{ matrix.sm }}" \
+            -DHPC_ENABLE_NCCL=ON \
+            -DHPC_ENABLE_MPI=ON \
+            -DHPC_ENABLE_NVTX=ON \
+            -DCMAKE_CUDA_FLAGS="-Xptxas -v" \
+            -DCMAKE_VERBOSE_MAKEFILE=OFF \
+            2>&1 | tee cmake_configure_${{ matrix.build_type }}_sm${{ matrix.sm }}.log
+
+      - name: Build
+        run: |
+          cmake --build build_${{ matrix.build_type }}_sm${{ matrix.sm }} \
+            --parallel $(nproc) \
+            2>&1 | tee cmake_build_${{ matrix.build_type }}_sm${{ matrix.sm }}.log
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ matrix.build_type }}-sm${{ matrix.sm }}
+          path: |
+            cmake_configure_*.log
+            cmake_build_*.log
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────
+  # Job 2: Unit + integration tests (Release, sm_80 only)
+  # ─────────────────────────────────────────────────────
+  test:
+    name: Tests (${{ matrix.suite }})
+    runs-on: [self-hosted, slurm, gpu]
+    needs: build
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - test_hpc_optimizers   # 12 tests: analytic, convergence, throughput
+          - test_precision         # 12 tests: FP32/FP16/BF16 round-trips, NaN
+          - test_zero2             # 12 tests: ZeRO-2 sharding, convergence, 500M tput
+          - test_zero3             # 12 tests: ZeRO-3 lifecycle, grad clip, memory
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: build_Release_sm80
+          key: cmake-Release-sm80-${{ hashFiles('CMakeLists.txt', 'include/**') }}
+          restore-keys: |
+            cmake-Release-sm80-
+
+      - name: Rebuild if cache miss
+        run: |
+          if [ ! -f "build_Release_sm80/CMakeCache.txt" ]; then
+            cmake -B build_Release_sm80 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCUDA_ARCHS="80" \
+              -DHPC_ENABLE_NCCL=ON \
+              -DHPC_ENABLE_MPI=ON \
+              -DHPC_ENABLE_NVTX=ON
+            cmake --build build_Release_sm80 --parallel $(nproc)
+          fi
+
+      - name: Set GPU environment
+        run: |
+          # Pin to a single GPU for unit tests (no NCCL needed)
+          echo "CUDA_VISIBLE_DEVICES=0" >> $GITHUB_ENV
+          echo "CUDA_DEVICE_ORDER=PCI_BUS_ID" >> $GITHUB_ENV
+
+      - name: Run ${{ matrix.suite }}
+        working-directory: build_Release_sm80
+        run: |
+          ctest \
+            --test-dir . \
+            --output-on-failure \
+            --timeout 300 \
+            -R "${{ matrix.suite }}" \
+            --output-junit ../test_results_${{ matrix.suite }}.xml \
+            -V 2>&1 | tee ../test_output_${{ matrix.suite }}.log
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.suite }}
+          path: |
+            test_results_${{ matrix.suite }}.xml
+            test_output_${{ matrix.suite }}.log
+          retention-days: 14
+
+      - name: Publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: test_results_${{ matrix.suite }}.xml
+          check_name: "Test Report — ${{ matrix.suite }}"
+          fail_on_failure: true
+          require_tests: true
+
+  # ────────────────────────────────────────────────────────
+  # Job 3: Multi-GPU tests (2-GPU NCCL, only if ≥2 GPUs)
+  # ────────────────────────────────────────────────────────
+  test-multigpu:
+    name: Multi-GPU Tests (NCCL, 2× GPU)
+    runs-on: [self-hosted, slurm, gpu, multi-gpu]
+    needs: [build, test]
+    timeout-minutes: 45
+    # Only run on push to main OR manual trigger with flag set
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_multigpu == 'true')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: build_Release_sm80
+          key: cmake-Release-sm80-${{ hashFiles('CMakeLists.txt', 'include/**') }}
+          restore-keys: |
+            cmake-Release-sm80-
+
+      - name: Rebuild if cache miss
+        run: |
+          if [ ! -f "build_Release_sm80/CMakeCache.txt" ]; then
+            cmake -B build_Release_sm80 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCUDA_ARCHS="80" \
+              -DHPC_ENABLE_NCCL=ON \
+              -DHPC_ENABLE_MPI=ON \
+              -DHPC_ENABLE_NVTX=ON
+            cmake --build build_Release_sm80 --parallel $(nproc)
+          fi
+
+      - name: Check GPU count
+        id: gpu_check
+        run: |
+          GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+          echo "gpu_count=${GPU_COUNT}" >> $GITHUB_OUTPUT
+          echo "Found ${GPU_COUNT} GPU(s)"
+          if [ "${GPU_COUNT}" -lt 2 ]; then
+            echo "Skipping multi-GPU tests: fewer than 2 GPUs available"
+          fi
+
+      - name: Run multi-GPU example (2 ranks, NCCL)
+        if: steps.gpu_check.outputs.gpu_count >= 2
+        run: |
+          # Launch train_multigpu with torchrun-style launcher via mpirun
+          mpirun --allow-run-as-root -np 2 \
+            --bind-to none \
+            --map-by slot:PE=16 \
+            -x NCCL_DEBUG=WARN \
+            -x NCCL_IB_DISABLE=0 \
+            -x CUDA_DEVICE_ORDER=PCI_BUS_ID \
+            build_Release_sm80/examples/train_multigpu \
+              --steps 100 \
+              --params 64000000 \
+            2>&1 | tee multigpu_test.log
+
+      - name: Upload multi-GPU logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multigpu-test-logs
+          path: multigpu_test.log
+          retention-days: 7
+
+  # ────────────────────────────────────────────
+  # Job 4: Aggregate result gate
+  # ────────────────────────────────────────────
+  ci-gate:
+    name: CI Gate (all tests pass)
+    runs-on: ubuntu-latest
+    needs: [build, test]
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.build.result }}" != "success" ]]; then
+            echo "Build job failed"; exit 1
+          fi
+          if [[ "${{ needs.test.result }}" != "success" ]]; then
+            echo "Test job failed"; exit 1
+          fi
+          echo "All required jobs passed ✓"

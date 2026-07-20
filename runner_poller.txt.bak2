@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# =============================================================================
+# runner_poller.sh  —  GitHub API poller: auto-submit SLURM jobs for queued runs
+#
+# Runs as a cron job every 2 minutes on the login node.
+# Checks GitHub Actions for queued workflow runs targeting self-hosted runners,
+# then submits SLURM batch jobs (ephemeral_runner.sh) to pick them up.
+#
+# Cron entry (installed by setup_runner.sh):
+#   */2 * * * * bash /opt/gh-runner/runner_poller.sh >> /opt/gh-runner/poller.log 2>&1
+#
+# Required env / config file:
+#   /opt/gh-runner/.runner_config   (written by setup_runner.sh)
+#   GH_PAT                          GitHub Personal Access Token with
+#                                   repo + actions + workflow scopes
+#                                   (set in environment or .runner_config)
+#
+# Optional:
+#   MAX_CONCURRENT_JOBS   Max simultaneous SLURM jobs (default: 4)
+#   EPHEMERAL_GPUS        GPUs per ephemeral runner job (default: 1)
+#   EPHEMERAL_NODES       Nodes per ephemeral runner job (default: 1)
+#   EPHEMERAL_TIME        Wall time for ephemeral jobs (default: 02:00:00)
+#   POLL_LABELS_FILTER    Comma-separated label filter (default: self-hosted,hpc)
+# =============================================================================
+set -euo pipefail
+
+# ── Load config ───────────────────────────────────────────────────────────────
+CONFIG_FILE="${RUNNER_INSTALL_DIR:-/opt/gh-runner}/.runner_config"
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+RUNNER_INSTALL_DIR="${RUNNER_INSTALL_DIR:-/opt/gh-runner}"
+source "${RUNNER_INSTALL_DIR}/runner_env.sh" 2>/dev/null || true
+
+# ── Required: GitHub PAT ──────────────────────────────────────────────────────
+GH_PAT="${GH_PAT:-}"
+if [[ -z "$GH_PAT" ]]; then
+  # Try reading from a secrets file (chmod 600, owned by runner user)
+  SECRETS_FILE="${RUNNER_INSTALL_DIR}/.gh_secrets"
+  [[ -f "$SECRETS_FILE" ]] && source "$SECRETS_FILE"
+fi
+if [[ -z "${GH_PAT:-}" ]]; then
+  echo "[poller][WARN] GH_PAT not set — cannot poll GitHub API. Set GH_PAT in environment or ${RUNNER_INSTALL_DIR}/.gh_secrets"
+  exit 0
+fi
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+MAX_CONCURRENT_JOBS="${MAX_CONCURRENT_JOBS:-4}"
+EPHEMERAL_GPUS="${EPHEMERAL_GPUS:-1}"
+EPHEMERAL_NODES="${EPHEMERAL_NODES:-1}"
+EPHEMERAL_TIME="${EPHEMERAL_TIME:-02:00:00}"
+EPHEMERAL_MEM="${EPHEMERAL_MEM:-128000}"
+POLL_LABELS_FILTER="${POLL_LABELS_FILTER:-self-hosted,hpc}"
+SLURM_PARTITION="${SLURM_PARTITION:-gpu}"
+GH_REPO_URL="${GH_REPO_URL:-}"
+LOCK_FILE="/tmp/gh_runner_poller.lock"
+
+# ── Parse repo owner/name from URL ───────────────────────────────────────────
+GH_ORG_REPO=$(echo "${GH_REPO_URL}" | sed 's|https://github.com/||')
+GH_API_BASE="https://api.github.com/repos/${GH_ORG_REPO}"
+
+ts()   { date '+%Y-%m-%d %H:%M:%S'; }
+info() { echo "[$(ts)][poller] $*"; }
+warn() { echo "[$(ts)][poller][WARN] $*"; }
+
+# ── Single-instance lock ──────────────────────────────────────────────────────
+if ! mkdir "${LOCK_FILE}" 2>/dev/null; then
+  # Check if the PID that holds the lock is still alive
+  LOCK_PID_FILE="${LOCK_FILE}/pid"
+  if [[ -f "$LOCK_PID_FILE" ]]; then
+    OLD_PID=$(cat "$LOCK_PID_FILE")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+      info "Another poller instance (PID ${OLD_PID}) is running — skipping."
+      exit 0
+    else
+      info "Stale lock from dead PID ${OLD_PID} — removing."
+      rm -rf "$LOCK_FILE"
+      mkdir "${LOCK_FILE}"
+    fi
+  fi
+fi
+echo $$ > "${LOCK_FILE}/pid"
+trap 'rm -rf "${LOCK_FILE}"' EXIT
+
+# ── Check SLURM availability ──────────────────────────────────────────────────
+if ! command -v sbatch &>/dev/null; then
+  warn "sbatch not found — cannot submit SLURM jobs. Skipping."
+  exit 0
+fi
+
+# ── Count currently running SLURM runner jobs ─────────────────────────────────
+RUNNING_JOBS=$(squeue --name "gh-ephemeral" --noheader --format="%j" 2>/dev/null | wc -l || echo 0)
+info "Current SLURM ephemeral runner jobs: ${RUNNING_JOBS} / ${MAX_CONCURRENT_JOBS}"
+
+if [[ "$RUNNING_JOBS" -ge "$MAX_CONCURRENT_JOBS" ]]; then
+  info "At max concurrent job limit (${MAX_CONCURRENT_JOBS}). Skipping poll."
+  exit 0
+fi
+SLOTS_AVAILABLE=$(( MAX_CONCURRENT_JOBS - RUNNING_JOBS ))
+
+# ── Query GitHub API for queued runs ─────────────────────────────────────────
+info "Querying GitHub Actions for queued workflow runs..."
+QUEUED_RESPONSE=$(curl -sSf \
+  -H "Authorization: Bearer ${GH_PAT}" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  "${GH_API_BASE}/actions/runs?status=queued&per_page=20" 2>/dev/null || echo '{"workflow_runs":[]}')
+
+QUEUED_COUNT=$(echo "$QUEUED_RESPONSE" | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); print(len(d.get('workflow_runs',[])))" 2>/dev/null || echo 0)
+info "Queued workflow runs: ${QUEUED_COUNT}"
+
+if [[ "$QUEUED_COUNT" -eq 0 ]]; then
+  info "No queued runs — nothing to do."
+  exit 0
+fi
+
+# ── Query for queued runner jobs (finer granularity) ─────────────────────────
+JOBS_RESPONSE=$(curl -sSf \
+  -H "Authorization: Bearer ${GH_PAT}" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  "${GH_API_BASE}/actions/runs?status=queued&per_page=20" 2>/dev/null || echo '{"workflow_runs":[]}')
+
+# Extract run IDs that need self-hosted runners
+RUNS_NEEDING_RUNNER=$(echo "$JOBS_RESPONSE" | python3 -c "
+import sys, json, re
+data = json.load(sys.stdin)
+filter_labels = set('${POLL_LABELS_FILTER}'.split(','))
+run_ids = []
+for run in data.get('workflow_runs', []):
+    run_ids.append(str(run['id']))
+print('\n'.join(run_ids))
+" 2>/dev/null || echo "")
+
+if [[ -z "$RUNS_NEEDING_RUNNER" ]]; then
+  info "No runs matching label filter '${POLL_LABELS_FILTER}'."
+  exit 0
+fi
+
+# ── Fetch a fresh registration token from GitHub ──────────────────────────────
+info "Fetching fresh runner registration token..."
+REG_TOKEN_RESPONSE=$(curl -sSf -X POST \
+  -H "Authorization: Bearer ${GH_PAT}" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  "${GH_API_BASE}/actions/runners/registration-token" 2>/dev/null || echo '{}')
+
+REG_TOKEN=$(echo "$REG_TOKEN_RESPONSE" | python3 -c \
+  "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || echo "")
+
+if [[ -z "$REG_TOKEN" ]]; then
+  warn "Could not obtain registration token from GitHub API."
+  warn "Check that GH_PAT has 'repo' and 'actions' scopes."
+  exit 1
+fi
+info "Registration token obtained (expires in ~1 hour)."
+
+# ── Submit ephemeral SLURM jobs ───────────────────────────────────────────────
+SUBMITTED=0
+while IFS= read -r RUN_ID && [[ "$SUBMITTED" -lt "$SLOTS_AVAILABLE" ]]; do
+  [[ -z "$RUN_ID" ]] && continue
+
+  SLURM_JOB_NAME="gh-ephemeral-${RUN_ID}"
+  BATCH_SCRIPT="/tmp/${SLURM_JOB_NAME}.sh"
+
+  cat > "$BATCH_SCRIPT" <<SBATCH
+#!/usr/bin/env bash
+#SBATCH --job-name=${SLURM_JOB_NAME}
+#SBATCH --partition=${SLURM_PARTITION}
+#SBATCH --nodes=${EPHEMERAL_NODES}
+#SBATCH --ntasks-per-node=${EPHEMERAL_GPUS}
+#SBATCH --gres=gpu:${EPHEMERAL_GPUS}
+#SBATCH --time=${EPHEMERAL_TIME}
+#SBATCH --mem=${EPHEMERAL_MEM}M
+#SBATCH --output=${RUNNER_INSTALL_DIR}/ephemeral-%j.log
+#SBATCH --error=${RUNNER_INSTALL_DIR}/ephemeral-%j.log
+#SBATCH --export=GH_REPO_URL,GH_RUNNER_TOKEN,RUNNER_INSTALL_DIR,RUNNER_WORKDIR,CUDA_HOME,LD_LIBRARY_PATH,PATH
+
+export GH_REPO_URL="${GH_REPO_URL}"
+export GH_RUNNER_TOKEN="${REG_TOKEN}"
+export RUNNER_INSTALL_DIR="${RUNNER_INSTALL_DIR}"
+export RUNNER_WORKDIR="${RUNNER_INSTALL_DIR}/work"
+
+bash "${RUNNER_INSTALL_DIR}/ephemeral_runner.sh"
+SBATCH
+
+  JOB_ID=$(sbatch --parsable "$BATCH_SCRIPT" 2>/dev/null || echo "")
+  rm -f "$BATCH_SCRIPT"
+
+  if [[ -n "$JOB_ID" ]]; then
+    info "Submitted SLURM job ${JOB_ID} for GitHub run ${RUN_ID}"
+    SUBMITTED=$(( SUBMITTED + 1 ))
+  else
+    warn "Failed to submit SLURM job for run ${RUN_ID}"
+  fi
+done <<< "$RUNS_NEEDING_RUNNER"
+
+info "Submitted ${SUBMITTED} new ephemeral runner job(s)."
